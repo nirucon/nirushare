@@ -3,14 +3,16 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{Read, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const PORT: u16 = 47831;
 const MAX_BYTES: usize = 25 * 1024 * 1024;
+const MAX_TEXT_BYTES: usize = 1024 * 1024;
+const EXPIRY_SECS: u64 = 7 * 24 * 60 * 60;
 
 #[derive(Serialize, Deserialize, Default)]
 struct Config {
@@ -28,11 +30,14 @@ struct Outgoing {
     kind: String,
     name: String,
     digest: String,
+    #[serde(default)]
+    created: u64,
     recipients: Vec<Recipient>,
 }
 #[derive(Serialize, Deserialize)]
 struct Recipient {
     host: String,
+    #[serde(default, skip_serializing)]
     token: String,
     status: String,
     attempts: u32,
@@ -109,8 +114,9 @@ fn ensure_dirs() -> Result<(), String> {
         data_dir().join("inbox"),
         data_dir().join("dedup"),
     ] {
-        fs::create_dir_all(&p).map_err(|e| format!("{}: {e}", p.display()))?;
+        private_dir(&p)?;
     }
+    private_file(&config_path()).ok();
     Ok(())
 }
 fn load_config() -> Result<Config, String> {
@@ -131,7 +137,9 @@ fn save_config(cfg: &Config) -> Result<(), String> {
     let tmp = config_path().with_extension(format!("tmp{}", std::process::id()));
     let data = serde_json::to_vec_pretty(cfg).map_err(|e| e.to_string())?;
     fs::write(&tmp, data).map_err(|e| e.to_string())?;
+    private_file(&tmp)?;
     fs::rename(&tmp, config_path()).map_err(|e| e.to_string())?;
+    private_file(&config_path())?;
     Ok(())
 }
 fn token() -> String {
@@ -146,6 +154,46 @@ fn now_id() -> String {
     let mut b = [0u8; 4];
     rand::thread_rng().fill_bytes(&mut b);
     format!("{}-{}", now_secs(), hex::encode(b))
+}
+fn valid_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 96
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+fn valid_host(host: &str) -> bool {
+    !host.is_empty()
+        && host.len() <= 253
+        && !host.starts_with('.')
+        && !host.ends_with('.')
+        && !host.contains("..")
+        && host
+            .split('.')
+            .all(|label| !label.is_empty() && !label.starts_with('-') && !label.ends_with('-'))
+        && host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+}
+fn private_dir(path: &Path) -> Result<(), String> {
+    fs::create_dir_all(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .map_err(|e| format!("{}: {e}", path.display()))
+}
+fn private_file(path: &Path) -> Result<(), String> {
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        .map_err(|e| format!("{}: {e}", path.display()))
+}
+fn image_extension(body: &[u8]) -> Option<&'static str> {
+    if body.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("png")
+    } else if body.starts_with(b"\xff\xd8\xff") {
+        Some("jpg")
+    } else if body.len() >= 12 && &body[0..4] == b"RIFF" && &body[8..12] == b"WEBP" {
+        Some("webp")
+    } else {
+        None
+    }
 }
 
 #[derive(Deserialize)]
@@ -290,7 +338,8 @@ fn header_value(request: &tiny_http::Request, name: &str) -> String {
         .unwrap_or_default()
 }
 
-fn handle_share(mut request: tiny_http::Request, cfg: &Config) -> Result<(), String> {
+fn handle_share(mut request: tiny_http::Request) -> Result<(), String> {
+    let cfg = load_config()?;
     let auth = request
         .headers()
         .iter()
@@ -298,11 +347,12 @@ fn handle_share(mut request: tiny_http::Request, cfg: &Config) -> Result<(), Str
         .map(|h| h.value.as_str().to_string())
         .unwrap_or_default();
     let token = auth.strip_prefix("Bearer ").unwrap_or("");
-    let sender = credentials(cfg, token).ok_or_else(|| "unauthorized".to_string())?;
+    let sender = credentials(&cfg, token).ok_or_else(|| "unauthorized".to_string())?;
     let id = header_value(&request, "X-Nirushare-Transfer");
     let kind = header_value(&request, "X-Nirushare-Kind");
     let name = header_value(&request, "X-Nirushare-Name");
-    if id.is_empty() || !matches!(kind.as_str(), "text" | "image") {
+    let announced = header_value(&request, "X-Nirushare-Digest");
+    if !valid_id(&id) || !matches!(kind.as_str(), "text" | "image") {
         return Err("bad transfer metadata".into());
     }
     let mut body = Vec::new();
@@ -311,12 +361,33 @@ fn handle_share(mut request: tiny_http::Request, cfg: &Config) -> Result<(), Str
         .take((MAX_BYTES + 1) as u64)
         .read_to_end(&mut body)
         .map_err(|e| e.to_string())?;
-    if body.len() > MAX_BYTES {
+    let limit = if kind == "text" {
+        MAX_TEXT_BYTES
+    } else {
+        MAX_BYTES
+    };
+    if body.len() > limit {
         return Err("payload too large".into());
     }
     let digest = digest(&body);
-    let dedup = data_dir().join("dedup").join(format!("{id}.json"));
-    if dedup.exists() {
+    if !announced.is_empty() && !announced.eq_ignore_ascii_case(&digest) {
+        return Err("payload digest mismatch".into());
+    }
+    let dedup_dir = data_dir().join("dedup").join(sender.replace('.', "_"));
+    private_dir(&dedup_dir)?;
+    let dedup = dedup_dir.join(format!("{id}.json"));
+    if let Ok(existing) = fs::read(&dedup) {
+        let same = serde_json::from_slice::<serde_json::Value>(&existing)
+            .ok()
+            .and_then(|v| {
+                v.get("digest")
+                    .and_then(|d| d.as_str())
+                    .map(|d| d == digest)
+            })
+            .unwrap_or(false);
+        if !same {
+            return Err("transfer id conflict".into());
+        }
         let response = tiny_http::Response::from_string("{\"ok\":true,\"duplicate\":true}")
             .with_header(
                 tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
@@ -345,15 +416,9 @@ fn handle_share(mut request: tiny_http::Request, cfg: &Config) -> Result<(), Str
     let mut path = String::new();
     let mut text = String::new();
     if kind == "image" {
-        if !body.starts_with(b"\x89PNG\r\n\x1a\n") {
-            return Err("image payload is not a PNG".into());
-        }
+        let ext = image_extension(&body).ok_or_else(|| "unsupported image content".to_string())?;
         let dir = downloads_dir().join("nirushare");
         fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-        let ext = Path::new(&safe)
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("bin");
         let filename = format!("{stamp}-{}.{}", id.replace('-', ""), ext);
         let dst = dir.join(filename);
         let tmp = dir.join(format!(".{}.part", id.replace('-', "")));
@@ -380,13 +445,16 @@ fn handle_share(mut request: tiny_http::Request, cfg: &Config) -> Result<(), Str
         serde_json::to_vec_pretty(&item).map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())?;
+    private_file(&tmp)?;
     fs::rename(&tmp, &meta).map_err(|e| e.to_string())?;
+    private_file(&meta)?;
     fs::write(
         &dedup,
         serde_json::to_vec(&serde_json::json!({"id": id, "digest": digest}))
             .map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())?;
+    private_file(&dedup)?;
     incoming_notice(&item);
     let response = tiny_http::Response::from_string("{\"ok\":true}").with_header(
         tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap(),
@@ -395,7 +463,6 @@ fn handle_share(mut request: tiny_http::Request, cfg: &Config) -> Result<(), Str
     Ok(())
 }
 fn serve() -> Result<(), String> {
-    let cfg = Arc::new(load_config()?);
     let (own, _) = tailscale()?;
     let own = own.ok_or("no Tailscale identity")?;
     if own.ip.is_empty() {
@@ -403,8 +470,7 @@ fn serve() -> Result<(), String> {
     }
     let addr = format!("{}:{}", own.ip, PORT);
     let server = tiny_http::Server::http(&addr).map_err(|e| format!("bind {addr}: {e}"))?;
-    let worker_cfg = cfg.clone();
-    thread::spawn(move || queue_worker(worker_cfg));
+    thread::spawn(queue_worker);
     eprintln!("nirushare listening on {addr}");
     for request in server.incoming_requests() {
         if request.method() == &tiny_http::Method::Get && request.url() == "/health" {
@@ -414,7 +480,7 @@ fn serve() -> Result<(), String> {
             continue;
         }
         if request.method() == &tiny_http::Method::Post && request.url().starts_with("/share") {
-            if let Err(e) = handle_share(request, &cfg) {
+            if let Err(e) = handle_share(request) {
                 eprintln!("share rejected: {e}");
             }
             continue;
@@ -425,13 +491,14 @@ fn serve() -> Result<(), String> {
     Ok(())
 }
 
-fn queue_worker(cfg: Arc<Config>) {
+fn queue_worker() {
     loop {
-        let _ = process_queue(&cfg);
-        thread::sleep(Duration::from_secs(2));
+        let _ = process_queue();
+        thread::sleep(Duration::from_secs(5));
     }
 }
-fn process_queue(_cfg: &Config) -> Result<(), String> {
+fn process_queue() -> Result<(), String> {
+    let cfg = load_config()?;
     let peers = tailscale().map(|(_, p)| p).unwrap_or_default();
     let dir = state_dir().join("out");
     let Ok(entries) = fs::read_dir(&dir) else {
@@ -453,11 +520,30 @@ fn process_queue(_cfg: &Config) -> Result<(), String> {
         let Ok(payload) = fs::read(&payload_path) else {
             continue;
         };
-        let mut changed = false;
+        if outgoing.created > 0 && now_secs().saturating_sub(outgoing.created) > EXPIRY_SECS {
+            for r in &mut outgoing.recipients {
+                if r.status != "delivered" && r.status != "cancelled" {
+                    r.status = "expired".into();
+                    r.last_error.clear();
+                }
+            }
+            let _ = fs::write(
+                path.join("meta.json"),
+                serde_json::to_vec_pretty(&outgoing).unwrap_or_default(),
+            );
+            continue;
+        }
+        let mut changed = outgoing.recipients.iter().any(|r| !r.token.is_empty());
         for r in &mut outgoing.recipients {
             if r.status == "delivered" || r.status == "cancelled" {
                 continue;
             }
+            let Some(trusted) = cfg.trusted.iter().find(|t| t.host == r.host) else {
+                r.status = "rejected".into();
+                r.last_error = "not trusted".into();
+                changed = true;
+                continue;
+            };
             let Some(peer) = find_peer(&peers, &r.host) else {
                 if r.status != "waiting" {
                     r.status = "waiting".into();
@@ -474,10 +560,11 @@ fn process_queue(_cfg: &Config) -> Result<(), String> {
             }
             let url = format!("http://{}:{}/share", peer.ip, PORT);
             let res = ureq::post(&url)
-                .set("Authorization", &format!("Bearer {}", r.token))
+                .set("Authorization", &format!("Bearer {}", trusted.token))
                 .set("X-Nirushare-Transfer", &outgoing.id)
                 .set("X-Nirushare-Kind", &outgoing.kind)
                 .set("X-Nirushare-Name", &outgoing.name)
+                .set("X-Nirushare-Digest", &outgoing.digest)
                 .timeout(Duration::from_secs(30))
                 .send_bytes(&payload);
             match res {
@@ -531,6 +618,9 @@ fn send(args: &[String]) -> Result<(), String> {
         match args[i].as_str() {
             "--to" if i + 1 < args.len() => {
                 let host = args[i + 1].clone();
+                if !valid_host(&host) {
+                    return Err("invalid host".into());
+                }
                 let t = cfg
                     .trusted
                     .iter()
@@ -538,7 +628,7 @@ fn send(args: &[String]) -> Result<(), String> {
                     .ok_or_else(|| format!("not trusted: {host}"))?;
                 recipients.push(Recipient {
                     host: t.host.clone(),
-                    token: t.token.clone(),
+                    token: String::new(),
                     status: "pending".into(),
                     attempts: 0,
                     last_error: String::new(),
@@ -562,7 +652,7 @@ fn send(args: &[String]) -> Result<(), String> {
         for t in &cfg.trusted {
             recipients.push(Recipient {
                 host: t.host.clone(),
-                token: t.token.clone(),
+                token: String::new(),
                 status: "pending".into(),
                 attempts: 0,
                 last_error: String::new(),
@@ -577,6 +667,8 @@ fn send(args: &[String]) -> Result<(), String> {
         if bytes.len() > MAX_BYTES {
             return Err("file too large".into());
         }
+        image_extension(&bytes)
+            .ok_or_else(|| "only PNG, JPEG or WebP images are supported".to_string())?;
         let name = path
             .file_name()
             .and_then(|n| n.to_str())
@@ -595,6 +687,7 @@ fn send(args: &[String]) -> Result<(), String> {
         kind,
         name,
         digest: digest(&payload),
+        created: now_secs(),
         recipients,
     };
     fs::write(
@@ -606,6 +699,9 @@ fn send(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 fn trust(host: &str, token: &str) -> Result<(), String> {
+    if !valid_host(host) || token.len() < 32 || !token.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("invalid host or token".into());
+    }
     let mut cfg = load_config()?;
     cfg.trusted.retain(|t| t.host != host);
     cfg.trusted.push(Trusted {
@@ -683,6 +779,9 @@ fn copy_item(id: &str) -> Result<(), String> {
     Ok(())
 }
 fn read_item(id: &str) -> Result<InboxItem, String> {
+    if !valid_id(id) {
+        return Err("invalid item id".into());
+    }
     let path = data_dir().join("inbox").join(format!("{id}.json"));
     let bytes = fs::read(path).map_err(|e| e.to_string())?;
     serde_json::from_slice(&bytes).map_err(|e| e.to_string())
@@ -709,7 +808,7 @@ fn email() -> Result<(), String> {
         );
         Command::new("xdg-email")
             .arg(uri)
-            .status()
+            .spawn()
             .map_err(|e| e.to_string())?;
         return Ok(());
     }
@@ -736,6 +835,45 @@ fn url_encode(s: &str) -> String {
         })
         .collect()
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transfer_ids_reject_paths_and_junk() {
+        assert!(valid_id("1793467977-0d11e618"));
+        assert!(valid_id("abc_DEF-123"));
+        for bad in ["", "../x", "a/b", "a\\b", "a.json", "..", "a\0b"] {
+            assert!(!valid_id(bad), "accepted {bad:?}");
+        }
+        assert!(!valid_id(&"a".repeat(97)));
+    }
+
+    #[test]
+    fn host_names_are_bounded() {
+        assert!(valid_host("othala.tailnet.ts.net"));
+        assert!(valid_host("othala"));
+        for bad in ["", "a/b", "a b", "..", "a\0b"] {
+            assert!(!valid_host(bad), "accepted {bad:?}");
+        }
+    }
+
+    #[test]
+    fn image_type_comes_from_bytes() {
+        assert_eq!(image_extension(b"\x89PNG\r\n\x1a\nrest"), Some("png"));
+        assert_eq!(image_extension(b"\xff\xd8\xffrest"), Some("jpg"));
+        assert_eq!(image_extension(b"RIFF0000WEBPrest"), Some("webp"));
+        assert_eq!(image_extension(b"<svg>"), None);
+        assert_eq!(image_extension(b"<html>"), None);
+    }
+
+    #[test]
+    fn encoding_is_utf8_and_percent_safe() {
+        assert_eq!(url_encode("NIRU Share"), "NIRU%20Share");
+        assert_eq!(url_encode("åäö"), "%C3%A5%C3%A4%C3%B6");
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
@@ -744,7 +882,7 @@ fn main() {
             Ok(())
         }
         Some("--help") | None => {
-            println!("NIRUSHARE 0.1.0\nUsage: nirushare serve|devices|trust HOST TOKEN|token|send --to HOST|--all|--file PATH|inbox|status|copy ID|open ID|email");
+            println!("NIRUSHARE {}\nUsage: nirushare serve|devices|trust HOST TOKEN|token|send --to HOST|--all|--file PATH|inbox|status|copy ID|open ID|email", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
         Some("serve") => serve(),
