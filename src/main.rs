@@ -720,7 +720,7 @@ fn email() -> Result<(), String> {
     Command::new("xdg-email")
         .args(["--subject", "NIRU Share", "--attach"])
         .arg(&path)
-        .status()
+        .spawn()
         .map_err(|e| e.to_string())?;
     Ok(())
 }
