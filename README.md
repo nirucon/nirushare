@@ -7,9 +7,11 @@ and images between your own trusted NIRUX devices over Tailscale. Choose one
 device, several devices or **All my devices**. Offline destinations get a
 durable delivery queue. Share by email opens a draft in the default mail client.
 
-**Repository state: specification and agent assignment only. There is no
-implemented or released NIRUSHARE application yet.** Commands and UI examples
-in these documents are proposed contracts, not features that already exist.
+**Repository state: early implementation, 0.1.0.** The Tailscale-only transfer
+core, pairing/trust records, durable queue, inbox, CLI and NIRUX bar/launcher
+entry points exist. The complete delivery scope in SPECIFICATION.md is not yet
+finished: notification actions, NIRUSHOT Review integration, full mail attachment
+handling and the complete native acceptance matrix remain open.
 
 ## Intended experience
 
@@ -60,6 +62,30 @@ Read in order:
 The owner supplies online machines, capabilities, temporary credentials and
 permissions in the execution conversation. No machine is authorized by name
 in this repository and no credentials belong here.
+
+## Current use
+
+Configured by NIRUX 0.12.145+; the receiving service is started by the NIRUWM
+session autostart. Pair trusted devices explicitly from a terminal:
+
+```sh
+token=$(nirushare token)
+# Run the same command on the peer with the other side's token:
+NIRUSHARE_TOKEN="$token" nirushare trust OTHER-DEVICE
+```
+
+Share the current clipboard to a trusted device or every trusted device:
+
+```sh
+nirushare send --clipboard --to studio
+nirushare send --clipboard --all
+nirushare devices
+nirushare inbox
+```
+
+Received images are stored below the real XDG Downloads directory in
+`nirushare/`. The Share icon is optional and intentionally absent from the
+new-install bar default; it is present in the configured test machines.
 
 ## Delivery principles
 
