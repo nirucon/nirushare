@@ -2,16 +2,17 @@
 
 **Part of [NIRUX — A minimal X11 desktop by Nicklas Rudolfsson](https://github.com/nirucon/nirux).**
 
-NIRUSHARE is the planned lightweight way to send clipboard text, screenshots
-and images between your own trusted NIRUX devices over Tailscale. Choose one
-device, several devices or **All my devices**. Offline destinations get a
-durable delivery queue. Share by email opens a draft in the default mail client.
+NIRUSHARE is the lightweight way to send clipboard text, screenshots and images
+between your own trusted NIRUX devices over Tailscale. Choose one device, several
+devices or **All my devices**. Offline destinations get a durable delivery queue.
+Share by email opens a draft in the default mail client.
 
-**Repository state: early implementation, 0.1.0.** The Tailscale-only transfer
-core, pairing/trust records, durable queue, inbox, CLI and NIRUX bar/launcher
-entry points exist. The complete delivery scope in SPECIFICATION.md is not yet
-finished: notification actions, NIRUSHOT Review integration, full mail attachment
-handling and the complete native acceptance matrix remain open.
+**Repository state: early implementation, 0.1.1.** The Tailscale-only transfer
+core, trust records, durable queue, inbox, CLI, NIRUX session autostart, bar and
+launcher entry points, notification actions, NIRUSHOT Review sharing and
+image-attachment mail drafts are implemented. The complete native acceptance
+matrix, the pairing/trust UI and full PAM edge-case support remain open; see
+STATUS.md. Do not treat this as final production acceptance.
 
 ## Intended experience
 
