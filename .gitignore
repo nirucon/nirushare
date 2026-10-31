@@ -1,0 +1,16 @@
+# Native build and task-local artifacts
+/target/
+/local/
+/evidence-private/
+__pycache__/
+.DS_Store
+
+# Credentials and private runtime data
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.log
+*.core
+*.sock
