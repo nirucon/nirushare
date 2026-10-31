@@ -265,6 +265,49 @@ fn tailscale() -> Result<(Option<Peer>, Vec<Peer>), String> {
     peers.sort_by(|a, b| a.host.cmp(&b.host));
     Ok((own, peers))
 }
+fn whois_hosts(ip: &str) -> Result<Vec<String>, String> {
+    let out = Command::new("tailscale")
+        .args(["whois", "--json", ip])
+        .output()
+        .map_err(|e| format!("tailscale whois: {e}"))?;
+    if !out.status.success() {
+        return Err("Tailscale cannot verify the sending node".into());
+    }
+    let value: serde_json::Value =
+        serde_json::from_slice(&out.stdout).map_err(|e| format!("whois json: {e}"))?;
+    let node = value.get("Node").ok_or("whois has no node identity")?;
+    let mut hosts = Vec::new();
+    for key in ["Name", "ComputedName"] {
+        if let Some(v) = node.get(key).and_then(|v| v.as_str()) {
+            hosts.push(v.trim_end_matches('.').to_string());
+        }
+    }
+    if let Some(v) = node
+        .get("Hostinfo")
+        .and_then(|v| v.get("Hostname"))
+        .and_then(|v| v.as_str())
+    {
+        hosts.push(v.to_string());
+    }
+    hosts.retain(|h| !h.is_empty());
+    if hosts.is_empty() {
+        return Err("whois has no usable node name".into());
+    }
+    Ok(hosts)
+}
+fn host_matches(expected: &str, actual: &str) -> bool {
+    expected == actual
+        || expected.split('.').next() == Some(actual)
+        || actual.split('.').next() == Some(expected)
+}
+fn verify_remote(expected: &str, ip: &str) -> Result<(), String> {
+    let hosts = whois_hosts(ip)?;
+    if hosts.iter().any(|h| host_matches(expected, h)) {
+        Ok(())
+    } else {
+        Err("Tailscale identity does not match the trusted host".into())
+    }
+}
 fn find_peer<'a>(peers: &'a [Peer], host: &str) -> Option<&'a Peer> {
     peers
         .iter()
@@ -348,6 +391,12 @@ fn handle_share(mut request: tiny_http::Request) -> Result<(), String> {
         .unwrap_or_default();
     let token = auth.strip_prefix("Bearer ").unwrap_or("");
     let sender = credentials(&cfg, token).ok_or_else(|| "unauthorized".to_string())?;
+    let remote = request
+        .remote_addr()
+        .ok_or_else(|| "missing peer address".to_string())?
+        .ip()
+        .to_string();
+    verify_remote(&sender, &remote)?;
     let id = header_value(&request, "X-Nirushare-Transfer");
     let kind = header_value(&request, "X-Nirushare-Kind");
     let name = header_value(&request, "X-Nirushare-Name");
