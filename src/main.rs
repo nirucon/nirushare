@@ -713,6 +713,18 @@ fn trust(host: &str, token: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn revoke(host: &str) -> Result<(), String> {
+    let mut cfg = load_config()?;
+    let before = cfg.trusted.len();
+    cfg.trusted.retain(|t| t.host != host);
+    if cfg.trusted.len() == before {
+        return Err(format!("not trusted: {host}"));
+    }
+    save_config(&cfg)?;
+    println!("revoked {host}");
+    Ok(())
+}
+
 fn status() -> Result<(), String> {
     let cfg = load_config()?;
     println!(
@@ -882,7 +894,7 @@ fn main() {
             Ok(())
         }
         Some("--help") | None => {
-            println!("NIRUSHARE {}\nUsage: nirushare serve|devices|trust HOST TOKEN|token|send --to HOST|--all|--file PATH|inbox|status|copy ID|open ID|email", env!("CARGO_PKG_VERSION"));
+            println!("NIRUSHARE {}\nUsage: nirushare serve|devices|trust HOST TOKEN|revoke HOST|token|send --to HOST|--all|--file PATH|inbox|status|copy ID|open ID|email", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
         Some("serve") => serve(),
@@ -896,6 +908,7 @@ fn main() {
             trust(&args[1], &value)
         }
         Some("trust") if args.len() == 3 => trust(&args[1], &args[2]),
+        Some("revoke") if args.len() == 2 => revoke(&args[1]),
         Some("send") => send(&args[1..]),
         Some("inbox") => list_inbox(),
         Some("status") => status(),
