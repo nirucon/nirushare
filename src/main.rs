@@ -237,19 +237,50 @@ fn credentials(cfg: &Config, token: &str) -> Option<String> {
         .map(|t| t.host.clone())
 }
 fn incoming_notice(item: &InboxItem) {
-    let (summary, body) = if item.kind == "text" {
-        (
-            "Text received",
-            format!("Text received from {}", item.sender),
-        )
-    } else {
-        (
-            "Image received",
-            format!("{} from {} · {}", item.name, item.sender, item.kind),
-        )
-    };
-    let _ = Command::new("notify-send").args([summary, &body]).status();
+    let item = item.clone();
+    thread::spawn(move || {
+        let (summary, body) = if item.kind == "text" {
+            (
+                "Text received",
+                format!("Text received from {}", item.sender),
+            )
+        } else {
+            (
+                "Image received",
+                format!("{} from {} · image", item.name, item.sender),
+            )
+        };
+        let mut command = Command::new("notify-send");
+        command.args(["--app-name", "NIRU Share", "--wait", summary, &body]);
+        if item.kind == "text" {
+            command.args(["--action=copy=Copy", "--action=inbox=Open inbox"]);
+        } else {
+            command.args(["--action=open=Open", "--action=folder=Open folder"]);
+        }
+        let Ok(output) = command.output() else {
+            return;
+        };
+        let action = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        match action.as_str() {
+            "copy" => {
+                let _ = copy_item(&item.id);
+            }
+            "open" => {
+                let _ = open_item(&item.id);
+            }
+            "folder" => {
+                if let Some(parent) = Path::new(&item.path).parent() {
+                    let _ = Command::new("xdg-open").arg(parent).status();
+                }
+            }
+            "inbox" => {
+                let _ = Command::new("nirulauncher").arg("--share").status();
+            }
+            _ => {}
+        }
+    });
 }
+
 fn header_value(request: &tiny_http::Request, name: &str) -> String {
     request
         .headers()
@@ -669,22 +700,31 @@ fn open_item(id: &str) -> Result<(), String> {
 }
 fn email() -> Result<(), String> {
     let (kind, _, payload) = read_clipboard()?;
-    let body = if kind == "text" {
-        String::from_utf8_lossy(&payload).to_string()
-    } else {
-        "NIRUSHARE image attachment".into()
-    };
-    let uri = format!(
-        "mailto:?subject={}&body={}",
-        url_encode("NIRU Share"),
-        url_encode(&body)
-    );
+    if kind == "text" {
+        let body = String::from_utf8_lossy(&payload).to_string();
+        let uri = format!(
+            "mailto:?subject={}&body={}",
+            url_encode("NIRU Share"),
+            url_encode(&body)
+        );
+        Command::new("xdg-email")
+            .arg(uri)
+            .status()
+            .map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+    let dir = state_dir().join("email");
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let path = dir.join(format!("share-{}.png", now_id()));
+    fs::write(&path, &payload).map_err(|e| e.to_string())?;
     Command::new("xdg-email")
-        .arg(uri)
+        .args(["--subject", "NIRU Share", "--attach"])
+        .arg(&path)
         .status()
         .map_err(|e| e.to_string())?;
     Ok(())
 }
+
 fn url_encode(s: &str) -> String {
     s.bytes()
         .map(|b| {
