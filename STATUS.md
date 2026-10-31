@@ -1,6 +1,6 @@
 # NIRUSHARE delivery status
 
-**State: SPECIFICATION ONLY — implementation not started.**
+**State: PARTIAL — core service and NIRUX integration released as 0.1.1; full delivery gates remain open.**
 
 The owner will provide the bare-metal targets and temporary access separately
 when assigning execution. No credentials or authorized host list are stored here.
@@ -10,12 +10,12 @@ Do not interpret this document as proof of a working service or shipped feature.
 
 | Phase | State | Next action / evidence |
 |---|---|---|
-| N0 — baseline/contracts | NOT STARTED | Inspect current NIRUX sources, receive host assignment, inventory APIs/capabilities. |
-| N1 — durable core/local API | NOT STARTED | Implement bounded storage/queue/IPC/clipboard contracts and regressions. |
-| N2 — transport/trust | NOT STARTED | Pair real receivers and prove tailnet/user boundaries. |
-| N3 — offline/broadcast | NOT STARTED | Prove persistence, retries/receipts/dedup and All my devices. |
-| N4 — NIRUX UX | NOT STARTED | Launcher, notify, bar, screenshot and image routes. |
-| N5 — email/packaging/services | NOT STARTED | Default mail drafts and native distro lifecycle/installers. |
+| N0 — baseline/contracts | PARTIAL | Bare-metal targets, service and release baseline established. |
+| N1 — durable core/local API | PARTIAL | Core queue/storage/CLI exists; full regression matrix remains. |
+| N2 — transport/trust | PARTIAL | Tailnet service and pairwise trust verified; pairing UI remains. |
+| N3 — offline/broadcast | PARTIAL | Queue/receipt/dedup core exists; fault/offline matrix remains. |
+| N4 — NIRUX UX | PARTIAL | Launcher, bar, notify and NIRUSHOT routes implemented; native acceptance remains. |
+| N5 — email/packaging/services | PARTIAL | NIRUX component/autostart and mail draft implemented; lifecycle matrix remains. |
 | N6 — native hardening | NOT STARTED | Complete ACCEPTANCE matrix and measured resource verification. |
 | N7 — release/rollout/docs/cleanup | NOT STARTED | Official final assets, activation, README reconciliation and retention. |
 
