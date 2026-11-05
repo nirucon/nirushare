@@ -224,6 +224,7 @@ struct TailscalePeer {
 struct Peer {
     host: String,
     ip: String,
+    port: u16,
     online: bool,
 }
 fn host_of(peer: &TailscalePeer) -> String {
@@ -242,7 +243,33 @@ fn ip_of(peer: &TailscalePeer) -> String {
         .or_else(|| peer.ips.as_ref().and_then(|v| v.first().cloned()))
         .unwrap_or_default()
 }
+/// Test-only transport override, compiled only with the `test-transport`
+/// feature (never in release builds): peers from NIRUSHARE_TEST_PEERS as
+/// `host=ip:port,host=offline`, so two local instances can talk on 127.0.0.1.
+#[cfg(feature = "test-transport")]
+fn test_peers() -> Option<Vec<Peer>> {
+    let spec = std::env::var("NIRUSHARE_TEST_PEERS").ok()?;
+    let mut peers = Vec::new();
+    for item in spec.split(',').filter(|s| !s.is_empty()) {
+        let (host, addr) = item.split_once('=')?;
+        let (ip, port, online) = match addr.rsplit_once(':') {
+            Some((ip, port)) => (ip.to_string(), port.parse().ok()?, true),
+            None => (String::new(), PORT, false),
+        };
+        peers.push(Peer {
+            host: host.to_string(),
+            ip,
+            port,
+            online,
+        });
+    }
+    Some(peers)
+}
 fn tailscale() -> Result<(Option<Peer>, Vec<Peer>), String> {
+    #[cfg(feature = "test-transport")]
+    if let Some(peers) = test_peers() {
+        return Ok((None, peers));
+    }
     let out = Command::new("tailscale")
         .args(["status", "--json"])
         .output()
@@ -255,6 +282,7 @@ fn tailscale() -> Result<(Option<Peer>, Vec<Peer>), String> {
     let own = status.own.as_ref().map(|p| Peer {
         host: host_of(p),
         ip: ip_of(p),
+        port: PORT,
         online: true,
     });
     let mut peers = Vec::new();
@@ -264,6 +292,7 @@ fn tailscale() -> Result<(Option<Peer>, Vec<Peer>), String> {
                 peers.push(Peer {
                     host: host_of(&p),
                     ip: ip_of(&p),
+                    port: PORT,
                     online: p.online.unwrap_or(false),
                 });
             }
@@ -273,6 +302,11 @@ fn tailscale() -> Result<(Option<Peer>, Vec<Peer>), String> {
     Ok((own, peers))
 }
 fn whois_hosts(ip: &str) -> Result<Vec<String>, String> {
+    // Test-only: the node name every local sender is reported as.
+    #[cfg(feature = "test-transport")]
+    if let Ok(host) = std::env::var("NIRUSHARE_TEST_WHOIS") {
+        return Ok(vec![host]);
+    }
     let out = Command::new("tailscale")
         .args(["whois", "--json", ip])
         .output()
@@ -353,7 +387,17 @@ fn credentials(cfg: &Config, token: &str) -> Option<String> {
     }
     found
 }
+fn notifications_enabled() -> bool {
+    #[cfg(feature = "test-transport")]
+    if std::env::var_os("NIRUSHARE_TEST_NO_NOTIFY").is_some() {
+        return false;
+    }
+    true
+}
 fn incoming_notice(item: &InboxItem) {
+    if !notifications_enabled() {
+        return;
+    }
     let item = item.clone();
     thread::spawn(move || {
         let (summary, body) = if item.kind == "text" {
@@ -398,58 +442,261 @@ fn incoming_notice(item: &InboxItem) {
     });
 }
 
-fn header_value(request: &tiny_http::Request, name: &str) -> String {
-    request
-        .headers()
-        .iter()
-        .find(|h| h.field.as_str().as_str().eq_ignore_ascii_case(name))
-        .map(|h| h.value.as_str().to_string())
-        .unwrap_or_default()
+// ── Receiving service ──────────────────────────────────────────────────────
+// A small HTTP/1.1 server on std sockets, so every connection has real read
+// deadlines: a slow or stalled sender holds one of a few workers for a bounded
+// time and never blocks the others. Protocol 1 is unchanged: POST /share with
+// Bearer token, X-Nirushare-* headers and a Content-Length body; GET /health.
+
+const WORKERS: usize = 3;
+const HEAD_LIMIT: usize = 16 * 1024;
+const HEAD_DEADLINE: Duration = Duration::from_secs(10);
+const BODY_DEADLINE: Duration = Duration::from_secs(60);
+
+fn body_deadline() -> Duration {
+    #[cfg(feature = "test-transport")]
+    if let Some(ms) = std::env::var("NIRUSHARE_TEST_BODY_DEADLINE_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        return Duration::from_millis(ms);
+    }
+    BODY_DEADLINE
 }
 
-fn handle_share(mut request: tiny_http::Request) -> Result<(), String> {
-    let cfg = load_config()?;
-    let auth = request
-        .headers()
-        .iter()
-        .find(|h| h.field.equiv("Authorization"))
-        .map(|h| h.value.as_str().to_string())
-        .unwrap_or_default();
-    let token = auth.strip_prefix("Bearer ").unwrap_or("");
-    let sender = credentials(&cfg, token).ok_or_else(|| "unauthorized".to_string())?;
-    let remote = request
-        .remote_addr()
-        .ok_or_else(|| "missing peer address".to_string())?
-        .ip()
-        .to_string();
-    verify_remote(&sender, &remote)?;
-    let id = header_value(&request, "X-Nirushare-Transfer");
-    let kind = header_value(&request, "X-Nirushare-Kind");
-    let name = header_value(&request, "X-Nirushare-Name");
-    let announced = header_value(&request, "X-Nirushare-Digest");
-    if !valid_id(&id) || !matches!(kind.as_str(), "text" | "image") {
-        return Err("bad transfer metadata".into());
+struct HttpRequest {
+    method: String,
+    path: String,
+    headers: Vec<(String, String)>,
+    /// Body bytes that arrived together with the head.
+    early_body: Vec<u8>,
+}
+impl HttpRequest {
+    fn header(&self, name: &str) -> String {
+        self.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default()
     }
-    let mut body = Vec::new();
-    request
-        .as_reader()
-        .take((MAX_BYTES + 1) as u64)
-        .read_to_end(&mut body)
-        .map_err(|e| e.to_string())?;
+    fn headers_named(&self, name: &str) -> Vec<&str> {
+        self.headers
+            .iter()
+            .filter(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+            .collect()
+    }
+}
+
+/// An HTTP error answer: status code and a short reason for the log.
+struct HttpError(u16, String);
+fn http_err(code: u16, msg: impl Into<String>) -> HttpError {
+    HttpError(code, msg.into())
+}
+
+fn reason(code: u16) -> &'static str {
+    match code {
+        100 => "Continue",
+        200 => "OK",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        408 => "Request Timeout",
+        409 => "Conflict",
+        411 => "Length Required",
+        413 => "Payload Too Large",
+        415 => "Unsupported Media Type",
+        501 => "Not Implemented",
+        503 => "Service Unavailable",
+        _ => "Internal Server Error",
+    }
+}
+fn respond(stream: &mut std::net::TcpStream, code: u16, body: &str) {
+    let head = format!(
+        "HTTP/1.1 {code} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        reason(code),
+        body.len()
+    );
+    let _ = stream.write_all(head.as_bytes());
+    let _ = stream.write_all(body.as_bytes());
+    let _ = stream.flush();
+}
+
+/// Read until the deadline or `want` more bytes, whichever comes first.
+fn read_some(
+    stream: &mut std::net::TcpStream,
+    buf: &mut [u8],
+    start: std::time::Instant,
+    deadline: Duration,
+) -> std::io::Result<usize> {
+    use std::io::ErrorKind;
+    loop {
+        let left = deadline
+            .checked_sub(start.elapsed())
+            .filter(|d| !d.is_zero())
+            .ok_or_else(|| std::io::Error::new(ErrorKind::TimedOut, "deadline"))?;
+        stream.set_read_timeout(Some(left))?;
+        match stream.read(buf) {
+            Ok(n) => return Ok(n),
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                return Err(std::io::Error::new(ErrorKind::TimedOut, "deadline"))
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+fn read_head(stream: &mut std::net::TcpStream) -> Result<HttpRequest, HttpError> {
+    let start = std::time::Instant::now();
+    let mut data = Vec::with_capacity(1024);
+    let mut buf = [0u8; 4096];
+    let end = loop {
+        if let Some(pos) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+            break pos;
+        }
+        if data.len() > HEAD_LIMIT {
+            return Err(http_err(400, "request head too large"));
+        }
+        match read_some(stream, &mut buf, start, HEAD_DEADLINE) {
+            Ok(0) => return Err(http_err(400, "connection closed in the request head")),
+            Ok(n) => data.extend_from_slice(&buf[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                return Err(http_err(408, "request head timed out"))
+            }
+            Err(e) => return Err(http_err(400, e.to_string())),
+        }
+    };
+    let head = std::str::from_utf8(&data[..end]).map_err(|_| http_err(400, "head not UTF-8"))?;
+    let mut lines = head.split("\r\n");
+    let mut parts = lines.next().unwrap_or_default().split(' ');
+    let (Some(method), Some(path), Some(version), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return Err(http_err(400, "bad request line"));
+    };
+    if !matches!(version, "HTTP/1.0" | "HTTP/1.1") || !path.starts_with('/') {
+        return Err(http_err(400, "bad request line"));
+    }
+    let mut headers = Vec::new();
+    for line in lines {
+        let Some((name, value)) = line.split_once(':') else {
+            return Err(http_err(400, "bad header"));
+        };
+        let token = |b: u8| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b);
+        if name.is_empty() || !name.bytes().all(token) || headers.len() >= 64 {
+            return Err(http_err(400, "bad header"));
+        }
+        headers.push((name.to_string(), value.trim().to_string()));
+    }
+    Ok(HttpRequest {
+        method: method.to_string(),
+        path: path.to_string(),
+        headers,
+        early_body: data[end + 4..].to_vec(),
+    })
+}
+
+/// The announced body length. Bodies must be sized: chunked uploads are not
+/// part of protocol 1, and every sender (0.2.x included) sets Content-Length.
+fn content_length(req: &HttpRequest) -> Result<usize, HttpError> {
+    if !req.header("Transfer-Encoding").is_empty() {
+        return Err(http_err(501, "chunked bodies are not supported"));
+    }
+    let values = req.headers_named("Content-Length");
+    let Some(first) = values.first() else {
+        return Err(http_err(411, "missing Content-Length"));
+    };
+    if values.iter().any(|v| v != first)
+        || first.is_empty()
+        || first.len() > 12
+        || !first.bytes().all(|b| b.is_ascii_digit())
+    {
+        return Err(http_err(400, "bad Content-Length"));
+    }
+    first
+        .parse()
+        .map_err(|_| http_err(400, "bad Content-Length"))
+}
+
+fn read_body(
+    stream: &mut std::net::TcpStream,
+    mut body: Vec<u8>,
+    len: usize,
+    deadline: Duration,
+) -> Result<Vec<u8>, HttpError> {
+    let start = std::time::Instant::now();
+    body.truncate(len);
+    body.reserve_exact(len - body.len());
+    let mut buf = vec![0u8; 64 * 1024];
+    while body.len() < len {
+        let want = buf.len().min(len - body.len());
+        match read_some(stream, &mut buf[..want], start, deadline) {
+            Ok(0) => return Err(http_err(400, "body ended early")),
+            Ok(n) => body.extend_from_slice(&buf[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                return Err(http_err(408, "body read deadline passed"))
+            }
+            Err(e) => return Err(http_err(400, e.to_string())),
+        }
+    }
+    Ok(body)
+}
+
+/// Received transfers are committed one at a time, so a retry racing the
+/// original cannot create a second inbox item.
+static COMMIT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn handle_share(
+    stream: &mut std::net::TcpStream,
+    req: HttpRequest,
+    remote: &str,
+) -> Result<&'static str, HttpError> {
+    let cfg = load_config().map_err(|e| http_err(500, e))?;
+    let auth = req.header("Authorization");
+    let token = auth.strip_prefix("Bearer ").unwrap_or("");
+    let sender = credentials(&cfg, token).ok_or_else(|| http_err(401, "unauthorized"))?;
+    verify_remote(&sender, remote).map_err(|e| http_err(403, e))?;
+    let id = req.header("X-Nirushare-Transfer");
+    let kind = req.header("X-Nirushare-Kind");
+    let name = req.header("X-Nirushare-Name");
+    let announced = req.header("X-Nirushare-Digest");
+    if !valid_id(&id) || !matches!(kind.as_str(), "text" | "image") {
+        return Err(http_err(400, "bad transfer metadata"));
+    }
     let limit = if kind == "text" {
         MAX_TEXT_BYTES
     } else {
         MAX_BYTES
     };
-    if body.len() > limit {
-        return Err("payload too large".into());
+    let len = content_length(&req)?;
+    if len > limit {
+        return Err(http_err(413, "payload too large"));
     }
+    if req.header("Expect").eq_ignore_ascii_case("100-continue") {
+        let _ = stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n");
+    }
+    let body = read_body(stream, req.early_body, len, body_deadline())?;
     let digest = digest(&body);
     if !announced.is_empty() && !announced.eq_ignore_ascii_case(&digest) {
-        return Err("payload digest mismatch".into());
+        return Err(http_err(400, "payload digest mismatch"));
     }
+    let _guard = COMMIT.lock().unwrap_or_else(|e| e.into_inner());
+    commit_share(&sender, &id, &kind, &name, &body, &digest)
+}
+
+fn commit_share(
+    sender: &str,
+    id: &str,
+    kind: &str,
+    name: &str,
+    body: &[u8],
+    digest: &str,
+) -> Result<&'static str, HttpError> {
+    let io = |e: std::io::Error| http_err(500, e.to_string());
     let dedup_dir = data_dir().join("dedup").join(sender.replace('.', "_"));
-    private_dir(&dedup_dir)?;
+    private_dir(&dedup_dir).map_err(|e| http_err(500, e))?;
     let dedup = dedup_dir.join(format!("{id}.json"));
     if let Ok(existing) = fs::read(&dedup) {
         let same = serde_json::from_slice::<serde_json::Value>(&existing)
@@ -461,21 +708,15 @@ fn handle_share(mut request: tiny_http::Request) -> Result<(), String> {
             })
             .unwrap_or(false);
         if !same {
-            return Err("transfer id conflict".into());
+            return Err(http_err(409, "transfer id conflict"));
         }
-        let response = tiny_http::Response::from_string("{\"ok\":true,\"duplicate\":true}")
-            .with_header(
-                tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
-                    .unwrap(),
-            );
-        let _ = request.respond(response);
-        return Ok(());
+        return Ok("{\"ok\":true,\"duplicate\":true}");
     }
     let stamp = now_secs();
     let display = if name.is_empty() {
         format!("{kind}-{stamp}")
     } else {
-        name.clone()
+        name.to_string()
     };
     let safe: String = display
         .chars()
@@ -491,23 +732,24 @@ fn handle_share(mut request: tiny_http::Request) -> Result<(), String> {
     let mut path = String::new();
     let mut text = String::new();
     if kind == "image" {
-        let ext = image_extension(&body).ok_or_else(|| "unsupported image content".to_string())?;
+        let ext =
+            image_extension(body).ok_or_else(|| http_err(415, "unsupported image content"))?;
         let dir = downloads_dir().join("nirushare");
-        fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        fs::create_dir_all(&dir).map_err(io)?;
         let filename = format!("{stamp}-{}.{}", id.replace('-', ""), ext);
         let dst = dir.join(filename);
         let tmp = dir.join(format!(".{}.part", id.replace('-', "")));
-        fs::write(&tmp, &body).map_err(|e| e.to_string())?;
-        fs::rename(&tmp, &dst).map_err(|e| e.to_string())?;
+        fs::write(&tmp, body).map_err(io)?;
+        fs::rename(&tmp, &dst).map_err(io)?;
         path = dst.display().to_string();
     } else {
-        text = String::from_utf8_lossy(&body).to_string();
+        text = String::from_utf8_lossy(body).to_string();
     }
     let item = InboxItem {
-        id: id.clone(),
-        kind: kind.clone(),
+        id: id.to_string(),
+        kind: kind.to_string(),
         name: safe,
-        sender: sender.clone(),
+        sender: sender.to_string(),
         received: stamp,
         path,
         text,
@@ -517,34 +759,84 @@ fn handle_share(mut request: tiny_http::Request) -> Result<(), String> {
     let tmp = meta.with_extension("part");
     fs::write(
         &tmp,
-        serde_json::to_vec_pretty(&item).map_err(|e| e.to_string())?,
+        serde_json::to_vec_pretty(&item).map_err(|e| http_err(500, e.to_string()))?,
     )
-    .map_err(|e| e.to_string())?;
-    private_file(&tmp)?;
-    fs::rename(&tmp, &meta).map_err(|e| e.to_string())?;
-    private_file(&meta)?;
+    .map_err(io)?;
+    private_file(&tmp).map_err(|e| http_err(500, e))?;
+    fs::rename(&tmp, &meta).map_err(io)?;
+    private_file(&meta).map_err(|e| http_err(500, e))?;
     fs::write(
         &dedup,
         serde_json::to_vec(&serde_json::json!({"id": id, "digest": digest}))
-            .map_err(|e| e.to_string())?,
+            .map_err(|e| http_err(500, e.to_string()))?,
     )
-    .map_err(|e| e.to_string())?;
-    private_file(&dedup)?;
+    .map_err(io)?;
+    private_file(&dedup).map_err(|e| http_err(500, e))?;
     incoming_notice(&item);
-    let response = tiny_http::Response::from_string("{\"ok\":true}").with_header(
-        tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap(),
-    );
-    let _ = request.respond(response);
-    Ok(())
+    Ok("{\"ok\":true}")
 }
-fn serve() -> Result<(), String> {
+
+fn handle_connection(mut stream: std::net::TcpStream) {
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
+    let remote = match stream.peer_addr() {
+        Ok(a) => a.ip().to_string(),
+        Err(_) => return,
+    };
+    let req = match read_head(&mut stream) {
+        Ok(r) => r,
+        Err(HttpError(code, msg)) => {
+            eprintln!("request rejected: {msg}");
+            respond(&mut stream, code, "{\"ok\":false}");
+            return;
+        }
+    };
+    let result = if req.method == "GET" && req.path == "/health" {
+        Ok("{\"ok\":true,\"protocol\":1}")
+    } else if req.method == "POST" && req.path.starts_with("/share") {
+        handle_share(&mut stream, req, &remote)
+    } else {
+        Err(http_err(404, "not found"))
+    };
+    match result {
+        Ok(body) => respond(&mut stream, 200, body),
+        Err(HttpError(code, msg)) => {
+            if code != 404 {
+                eprintln!("share rejected: {msg}");
+            }
+            respond(&mut stream, code, "{\"ok\":false}");
+            // Let the sender read the answer instead of a reset: stop
+            // writing and discard a bounded amount of unread body.
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+            let start = std::time::Instant::now();
+            let mut buf = [0u8; 16 * 1024];
+            let mut drained = 0;
+            while drained < MAX_TEXT_BYTES {
+                match read_some(&mut stream, &mut buf, start, Duration::from_secs(2)) {
+                    Ok(n) if n > 0 => drained += n,
+                    _ => break,
+                }
+            }
+        }
+    }
+}
+
+fn listen_addr() -> Result<String, String> {
+    #[cfg(feature = "test-transport")]
+    if let Ok(addr) = std::env::var("NIRUSHARE_TEST_LISTEN") {
+        return Ok(addr);
+    }
     let (own, _) = tailscale()?;
     let own = own.ok_or("no Tailscale identity")?;
     if own.ip.is_empty() {
         return Err("no Tailscale IPv4 address".into());
     }
-    let addr = format!("{}:{}", own.ip, PORT);
-    let server = tiny_http::Server::http(&addr).map_err(|e| format!("bind {addr}: {e}"))?;
+    Ok(format!("{}:{}", own.ip, PORT))
+}
+
+fn serve() -> Result<(), String> {
+    use std::sync::mpsc;
+    let addr = listen_addr()?;
+    let listener = std::net::TcpListener::bind(&addr).map_err(|e| format!("bind {addr}: {e}"))?;
     let wake = match bind_wake() {
         Ok(sock) => Some(sock),
         Err(e) => {
@@ -553,22 +845,35 @@ fn serve() -> Result<(), String> {
         }
     };
     thread::spawn(move || queue_worker(wake));
-    eprintln!("nirushare listening on {addr}");
-    for request in server.incoming_requests() {
-        if request.method() == &tiny_http::Method::Get && request.url() == "/health" {
-            let _ = request.respond(tiny_http::Response::from_string(
-                "{\"ok\":true,\"protocol\":1}",
-            ));
-            continue;
-        }
-        if request.method() == &tiny_http::Method::Post && request.url().starts_with("/share") {
-            if let Err(e) = handle_share(request) {
-                eprintln!("share rejected: {e}");
+    // A small bounded pool: each connection is handled by one worker, with a
+    // short backlog; beyond that a sender gets 503 and retries later.
+    let (tx, rx) = mpsc::sync_channel::<std::net::TcpStream>(WORKERS * 4);
+    let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
+    for _ in 0..WORKERS {
+        let rx = rx.clone();
+        thread::spawn(move || loop {
+            let next = match rx.lock() {
+                Ok(guard) => guard.recv(),
+                Err(_) => return,
+            };
+            match next {
+                Ok(stream) => handle_connection(stream),
+                Err(_) => return,
             }
-            continue;
+        });
+    }
+    eprintln!("nirushare listening on {addr}");
+    for stream in listener.incoming() {
+        match stream {
+            Ok(stream) => {
+                if let Err(mpsc::TrySendError::Full(mut stream)) = tx.try_send(stream) {
+                    let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
+                    respond(&mut stream, 503, "{\"ok\":false,\"busy\":true}");
+                }
+            }
+            // Out of descriptors or similar: do not spin.
+            Err(_) => thread::sleep(Duration::from_millis(200)),
         }
-        let _ = request
-            .respond(tiny_http::Response::from_string("{\"ok\":false}").with_status_code(404));
     }
     Ok(())
 }
@@ -868,7 +1173,7 @@ fn process_queue(out: &Path, history: &Path, env: &mut QueueEnv) -> Option<u64> 
 }
 
 fn deliver_http(d: &Delivery) -> Result<(), DeliverError> {
-    let url = format!("http://{}:{}/share", d.peer.ip, PORT);
+    let url = format!("http://{}:{}/share", d.peer.ip, d.peer.port);
     ureq::post(&url)
         .set("Authorization", &format!("Bearer {}", d.token))
         .set("X-Nirushare-Transfer", &d.outgoing.id)
@@ -907,6 +1212,7 @@ fn send(args: &[String]) -> Result<(), String> {
     let all = args.iter().any(|a| a == "--all");
     let mut recipients = Vec::new();
     let mut file: Option<PathBuf> = None;
+    let mut stdin_text = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -941,6 +1247,10 @@ fn send(args: &[String]) -> Result<(), String> {
             "--clipboard" => {
                 i += 1;
             }
+            "--stdin" => {
+                stdin_text = true;
+                i += 1;
+            }
             _ => return Err(format!("unknown send option: {}", args[i])),
         }
     }
@@ -973,6 +1283,19 @@ fn send(args: &[String]) -> Result<(), String> {
             .unwrap_or("file")
             .to_string();
         ("image".to_string(), name, bytes)
+    } else if stdin_text {
+        let mut text = Vec::new();
+        std::io::stdin()
+            .take(MAX_TEXT_BYTES as u64 + 1)
+            .read_to_end(&mut text)
+            .map_err(|e| format!("stdin: {e}"))?;
+        if text.len() > MAX_TEXT_BYTES {
+            return Err("text too large".into());
+        }
+        if text.is_empty() {
+            return Err("no text on stdin".into());
+        }
+        ("text".to_string(), "text.txt".to_string(), text)
     } else {
         read_clipboard()?
     };
@@ -1151,7 +1474,7 @@ fn main() {
             Ok(())
         }
         Some("--help") | None => {
-            println!("NIRUSHARE {}\nUsage: nirushare serve|devices|trust HOST TOKEN|revoke HOST|token|send --to HOST|--all|--file PATH|inbox|status|copy ID|open ID|email", env!("CARGO_PKG_VERSION"));
+            println!("NIRUSHARE {}\nUsage: nirushare serve|devices|trust HOST TOKEN|revoke HOST|token|send --to HOST|--all [--file PATH|--stdin]|inbox|status|copy ID|open ID|email", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
         Some("serve") => serve(),
@@ -1254,6 +1577,7 @@ mod tests {
         Peer {
             host: host.into(),
             ip: "127.0.0.1".into(),
+            port: PORT,
             online: true,
         }
     }
