@@ -90,3 +90,30 @@ Record measured RSS/CPU/latency rather than advertise a guessed performance clai
 Do not stop with a final success report before this gate. If no executable work
 remains solely because an external requirement is unavailable, use a precise
 PARTIAL/BLOCKED report, not “fully operational” or “100% complete.”
+
+## 0.3.0 results (2026-11-05)
+
+Candidate: source at `v0.3.0`, built on othala (Debian 13). The candidate
+service ran from a private temporary home on othala, listening on 127.0.0.1
+through the test-only transport override (a `test-transport` build) while
+using the real Tailscale CLI for peers; the installed 0.2.1 service was left
+running. All temporary homes, test items and helper processes were removed.
+
+| Case | Host | Result |
+|---|---|---|
+| Locked build and tests, rustc 1.85.1 and stable | othala | PASS: 18 unit tests, 1 two-instance test |
+| Static musl release binary runs (`--version`, `status`, `inbox --clear-read`, `send` refusal) | void (runit), algiz (Arch) | PASS |
+| Idle service, empty queue, `strace -f -e execve` for 60 s | othala | PASS: 0 execve, 0 CPU ticks (0.2.1: 12 `tailscale status` runs, 72 execve with PATH lookups, 11 ticks) |
+| Upgrade over a legacy queue: 3 `delivered` entries with `created: 0`, 600 KiB payloads | othala (temp home) | PASS: archived to `history.jsonl` on start, queue directory empty, payloads removed, `created` taken from the entry mtime |
+| New sender to 0.2.1 receiver: text via `send --stdin`, 8x8 PNG via `send --file` | othala -> void | PASS: both delivered on the first attempt, one `tailscale status` per send, digest identical on void; test items, file and dedup receipts removed from void afterwards |
+| Offline receiver then online, stalled sender, 0.2.x-style sender, duplicates, 401/400/409/413, 3 MB image | two local instances (CI and othala) | PASS (`tests/two_instances.rs`) |
+
+Deferred to the NIRUX deployment (needs the installed service on port 47831):
+- 0.2.1 sender (void or algiz) to an installed 0.3.0 receiver, text and image.
+- Both directions between installed 0.3.0 services; an offline device that comes
+  back; `nirushare status` on the sender while it waits.
+- A stalled sender against an installed receiver while another host sends.
+- The upgrade over niruxwork's real queue (3 delivered legacy entries) and the
+  60 s idle `strace` of the installed service there.
+- `/proc/<pid>/exe` of the restarted service on the new generation, and the
+  progress notification for an image over 2 MB on a real NIRUNOTIFY session.

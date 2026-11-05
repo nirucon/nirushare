@@ -20,7 +20,7 @@ jobs:
       - run: |
           bin=target/x86_64-unknown-linux-musl/release/nirushare
           test "$($bin --version)" = "NIRUSHARE ${GITHUB_REF_NAME#v}"
-          file $bin | grep -q 'statically linked'
+          file $bin | grep -qE 'statically linked|static-pie linked'
           ! grep -q NIRUSHARE_TEST_ $bin
       # The checksums are generated here from the published binary; nothing
       # in the repository is reused.
