@@ -542,101 +542,218 @@ fn serve() -> Result<(), String> {
 
 fn queue_worker() {
     loop {
-        let _ = process_queue();
+        if let Ok(cfg) = load_config() {
+            let mut peers = || tailscale().map(|(_, p)| p).unwrap_or_default();
+            let mut deliver = deliver_http;
+            let mut env = QueueEnv {
+                cfg: &cfg,
+                now: now_secs(),
+                peers: &mut peers,
+                deliver: &mut deliver,
+            };
+            process_queue(&state_dir().join("out"), &history_path(), &mut env);
+        }
         thread::sleep(Duration::from_secs(5));
     }
 }
-fn process_queue() -> Result<(), String> {
-    let cfg = load_config()?;
-    let peers = tailscale().map(|(_, p)| p).unwrap_or_default();
-    let dir = state_dir().join("out");
-    let Ok(entries) = fs::read_dir(&dir) else {
-        return Ok(());
+
+/// A recipient in one of these states is never sent to again.
+fn is_final(status: &str) -> bool {
+    matches!(
+        status,
+        "delivered" | "cancelled" | "expired" | "rejected" | "failed"
+    )
+}
+fn all_final(outgoing: &Outgoing) -> bool {
+    outgoing.recipients.iter().all(|r| is_final(&r.status))
+}
+fn history_path() -> PathBuf {
+    state_dir().join("history.jsonl")
+}
+fn write_meta(dir: &Path, outgoing: &Outgoing) -> Result<(), String> {
+    let data = serde_json::to_vec_pretty(outgoing).map_err(|e| e.to_string())?;
+    let tmp = dir.join(format!(".meta.json.tmp{}", std::process::id()));
+    fs::write(&tmp, data).map_err(|e| e.to_string())?;
+    private_file(&tmp)?;
+    fs::rename(&tmp, dir.join("meta.json")).map_err(|e| e.to_string())
+}
+
+/// Finished transfers leave the queue: a compact record without payload is
+/// appended to the history, and the entry directory (payload included) is
+/// removed. History keeps the newest HISTORY_KEEP records.
+const HISTORY_KEEP: usize = 500;
+fn archive(dir: &Path, history: &Path, outgoing: &Outgoing, now: u64) -> Result<(), String> {
+    let record = serde_json::json!({
+        "id": outgoing.id,
+        "kind": outgoing.kind,
+        "name": outgoing.name,
+        "created": outgoing.created,
+        "finished": now,
+        "recipients": outgoing.recipients.iter().map(|r| serde_json::json!({
+            "host": r.host,
+            "status": r.status,
+            "attempts": r.attempts,
+            "last_error": r.last_error,
+        })).collect::<Vec<_>>(),
+    });
+    let mut lines: Vec<String> = fs::read_to_string(history)
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(str::to_string)
+        .collect();
+    lines.push(record.to_string());
+    let skip = lines.len().saturating_sub(HISTORY_KEEP);
+    let mut data = lines[skip..].join("\n");
+    data.push('\n');
+    let tmp = history.with_extension(format!("tmp{}", std::process::id()));
+    fs::write(&tmp, data).map_err(|e| e.to_string())?;
+    private_file(&tmp)?;
+    fs::rename(&tmp, history).map_err(|e| e.to_string())?;
+    // Only the entry directory this record describes is removed; it lives in
+    // the private queue and its name was validated as a transfer id.
+    fs::remove_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))
+}
+#[cfg(test)]
+fn read_history(history: &Path) -> Vec<serde_json::Value> {
+    fs::read_to_string(history)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect()
+}
+
+/// Why a delivery attempt failed, in words for `nirushare status`.
+struct DeliverError {
+    message: String,
+    permanent: bool,
+}
+struct Delivery<'a> {
+    outgoing: &'a Outgoing,
+    peer: &'a Peer,
+    token: &'a str,
+    payload: &'a [u8],
+}
+struct QueueEnv<'a> {
+    cfg: &'a Config,
+    now: u64,
+    peers: &'a mut dyn FnMut() -> Vec<Peer>,
+    deliver: &'a mut dyn FnMut(&Delivery) -> Result<(), DeliverError>,
+}
+
+/// One pass over the outgoing queue. Final entries are archived without
+/// their payload ever being read; the payload is read only right before a
+/// send attempt.
+fn process_queue(out: &Path, history: &Path, env: &mut QueueEnv) {
+    let Ok(entries) = fs::read_dir(out) else {
+        return;
     };
+    let mut peers: Option<Vec<Peer>> = None;
     for entry in entries.flatten() {
         let path = entry.path();
-        if !path.is_dir() {
+        let name = entry.file_name();
+        if !path.is_dir() || !name.to_str().map(valid_id).unwrap_or(false) {
             continue;
         }
-        let meta_path = path.join("meta.json");
-        let payload_path = path.join("payload");
-        let Ok(meta_bytes) = fs::read(&meta_path) else {
+        let Ok(meta_bytes) = fs::read(path.join("meta.json")) else {
             continue;
         };
         let Ok(mut outgoing) = serde_json::from_slice::<Outgoing>(&meta_bytes) else {
             continue;
         };
-        let Ok(payload) = fs::read(&payload_path) else {
+        if all_final(&outgoing) {
+            let _ = archive(&path, history, &outgoing, env.now);
             continue;
-        };
-        if outgoing.created > 0 && now_secs().saturating_sub(outgoing.created) > EXPIRY_SECS {
+        }
+        let mut changed = outgoing.recipients.iter().any(|r| !r.token.is_empty());
+        if outgoing.created > 0 && env.now.saturating_sub(outgoing.created) > EXPIRY_SECS {
             for r in &mut outgoing.recipients {
-                if r.status != "delivered" && r.status != "cancelled" {
+                if !is_final(&r.status) {
                     r.status = "expired".into();
                     r.last_error.clear();
                 }
             }
-            let _ = fs::write(
-                path.join("meta.json"),
-                serde_json::to_vec_pretty(&outgoing).unwrap_or_default(),
-            );
+            let _ = archive(&path, history, &outgoing, env.now);
             continue;
         }
-        let mut changed = outgoing.recipients.iter().any(|r| !r.token.is_empty());
-        for r in &mut outgoing.recipients {
-            if r.status == "delivered" || r.status == "cancelled" {
+        let mut payload: Option<Vec<u8>> = None;
+        for i in 0..outgoing.recipients.len() {
+            if is_final(&outgoing.recipients[i].status) {
                 continue;
             }
-            let Some(trusted) = cfg.trusted.iter().find(|t| t.host == r.host) else {
+            let host = outgoing.recipients[i].host.clone();
+            let Some(trusted) = env.cfg.trusted.iter().find(|t| t.host == host) else {
+                let r = &mut outgoing.recipients[i];
                 r.status = "rejected".into();
-                r.last_error = "not trusted".into();
+                r.last_error = "no longer trusted on this device".into();
                 changed = true;
                 continue;
             };
-            let Some(peer) = find_peer(&peers, &r.host) else {
+            let peers = peers.get_or_insert_with(|| (env.peers)());
+            let peer = find_peer(peers, &host).filter(|p| p.online && !p.ip.is_empty());
+            let Some(peer) = peer else {
+                let r = &mut outgoing.recipients[i];
                 if r.status != "waiting" {
                     r.status = "waiting".into();
                     changed = true;
                 }
                 continue;
             };
-            if !peer.online || peer.ip.is_empty() {
-                if r.status != "waiting" {
-                    r.status = "waiting".into();
-                    changed = true;
+            if payload.is_none() {
+                match fs::read(path.join("payload")) {
+                    Ok(bytes) => payload = Some(bytes),
+                    Err(_) => {
+                        let r = &mut outgoing.recipients[i];
+                        r.status = "failed".into();
+                        r.last_error = "the queued content is missing".into();
+                        changed = true;
+                        continue;
+                    }
                 }
-                continue;
             }
-            let url = format!("http://{}:{}/share", peer.ip, PORT);
-            let res = ureq::post(&url)
-                .set("Authorization", &format!("Bearer {}", trusted.token))
-                .set("X-Nirushare-Transfer", &outgoing.id)
-                .set("X-Nirushare-Kind", &outgoing.kind)
-                .set("X-Nirushare-Name", &outgoing.name)
-                .set("X-Nirushare-Digest", &outgoing.digest)
-                .timeout(Duration::from_secs(30))
-                .send_bytes(&payload);
-            match res {
-                Ok(_) => {
+            let result = (env.deliver)(&Delivery {
+                outgoing: &outgoing,
+                peer,
+                token: &trusted.token,
+                payload: payload.as_deref().unwrap_or_default(),
+            });
+            let r = &mut outgoing.recipients[i];
+            match result {
+                Ok(()) => {
                     r.status = "delivered".into();
                     r.last_error.clear();
                 }
                 Err(e) => {
                     r.attempts += 1;
-                    r.last_error = e.to_string();
-                    r.status = "waiting".into();
+                    r.last_error = e.message;
+                    r.status = if e.permanent { "failed" } else { "waiting" }.into();
                 }
             }
             changed = true;
         }
-        if changed {
-            let _ = fs::write(
-                path.join("meta.json"),
-                serde_json::to_vec_pretty(&outgoing).unwrap_or_default(),
-            );
+        if all_final(&outgoing) {
+            let _ = archive(&path, history, &outgoing, env.now);
+        } else if changed {
+            let _ = write_meta(&path, &outgoing);
         }
     }
-    Ok(())
+}
+
+fn deliver_http(d: &Delivery) -> Result<(), DeliverError> {
+    let url = format!("http://{}:{}/share", d.peer.ip, PORT);
+    ureq::post(&url)
+        .set("Authorization", &format!("Bearer {}", d.token))
+        .set("X-Nirushare-Transfer", &d.outgoing.id)
+        .set("X-Nirushare-Kind", &d.outgoing.kind)
+        .set("X-Nirushare-Name", &d.outgoing.name)
+        .set("X-Nirushare-Digest", &d.outgoing.digest)
+        .timeout(Duration::from_secs(30))
+        .send_bytes(d.payload)
+        .map(|_| ())
+        .map_err(|e| DeliverError {
+            message: e.to_string(),
+            permanent: false,
+        })
 }
 
 fn read_clipboard() -> Result<(String, String, Vec<u8>), String> {
@@ -936,6 +1053,213 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A private scratch directory, removed again when the test ends.
+    struct TempDir(PathBuf);
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    impl std::ops::Deref for TempDir {
+        type Target = Path;
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+    fn temp_dir(tag: &str) -> TempDir {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "nirushare-test-{}-{tag}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::SeqCst)
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        TempDir(dir)
+    }
+    fn recipient(host: &str, status: &str) -> Recipient {
+        Recipient {
+            host: host.into(),
+            token: String::new(),
+            status: status.into(),
+            attempts: 0,
+            last_error: String::new(),
+        }
+    }
+    fn queue_entry(out: &Path, id: &str, created: u64, recipients: Vec<Recipient>) -> PathBuf {
+        let dir = out.join(id);
+        fs::create_dir_all(&dir).unwrap();
+        let o = Outgoing {
+            id: id.into(),
+            kind: "text".into(),
+            name: "clipboard.txt".into(),
+            digest: digest(b"hello"),
+            created,
+            recipients,
+        };
+        write_meta(&dir, &o).unwrap();
+        dir
+    }
+    /// A payload that cannot be read as a file: reading it fails even as root.
+    fn unreadable_payload(dir: &Path) {
+        fs::create_dir_all(dir.join("payload")).unwrap();
+    }
+    fn trusted_cfg(hosts: &[&str]) -> Config {
+        Config {
+            version: 1,
+            trusted: hosts
+                .iter()
+                .map(|h| Trusted {
+                    host: h.to_string(),
+                    token: "ab".repeat(24),
+                })
+                .collect(),
+        }
+    }
+    fn online(host: &str) -> Peer {
+        Peer {
+            host: host.into(),
+            ip: "127.0.0.1".into(),
+            online: true,
+        }
+    }
+    fn read_meta(dir: &Path) -> Outgoing {
+        serde_json::from_slice(&fs::read(dir.join("meta.json")).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn final_entries_are_archived_without_reading_the_payload() {
+        let root = temp_dir("final");
+        let out = root.join("out");
+        let history = root.join("history.jsonl");
+        let now = 1_800_000_000;
+        let done = queue_entry(
+            &out,
+            "1-done",
+            now - 10,
+            vec![
+                recipient("othala", "delivered"),
+                recipient("void", "cancelled"),
+            ],
+        );
+        unreadable_payload(&done);
+        let cfg = trusted_cfg(&["othala", "void"]);
+        let mut peer_calls = 0;
+        let mut peers = || {
+            peer_calls += 1;
+            vec![online("othala")]
+        };
+        let mut sends = 0;
+        let mut deliver = |_: &Delivery| -> Result<(), DeliverError> {
+            sends += 1;
+            Ok(())
+        };
+        let mut env = QueueEnv {
+            cfg: &cfg,
+            now,
+            peers: &mut peers,
+            deliver: &mut deliver,
+        };
+        process_queue(&out, &history, &mut env);
+        assert!(!done.exists(), "final entry and its payload are removed");
+        assert_eq!(sends, 0);
+        assert_eq!(peer_calls, 0, "no Tailscale query without due recipients");
+        let records = read_history(&history);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["id"], "1-done");
+        assert_eq!(records[0]["recipients"][0]["status"], "delivered");
+        assert!(records[0].get("payload").is_none());
+    }
+
+    #[test]
+    fn payload_is_read_only_for_a_send_attempt() {
+        let root = temp_dir("lazy");
+        let out = root.join("out");
+        let history = root.join("history.jsonl");
+        let now = 1_800_000_000;
+        // void is offline: its unreadable payload must not matter yet.
+        let waiting = queue_entry(&out, "2-wait", now, vec![recipient("void", "pending")]);
+        unreadable_payload(&waiting);
+        let cfg = trusted_cfg(&["void"]);
+        let mut peers = || vec![];
+        let mut deliver = |_: &Delivery| -> Result<(), DeliverError> { panic!("no send") };
+        let mut env = QueueEnv {
+            cfg: &cfg,
+            now,
+            peers: &mut peers,
+            deliver: &mut deliver,
+        };
+        process_queue(&out, &history, &mut env);
+        assert_eq!(read_meta(&waiting).recipients[0].status, "waiting");
+    }
+
+    #[test]
+    fn queue_state_transitions() {
+        let root = temp_dir("states");
+        let out = root.join("out");
+        let history = root.join("history.jsonl");
+        let now = 1_800_000_000;
+        let dir = queue_entry(
+            &out,
+            "3-mixed",
+            now,
+            vec![
+                recipient("othala", "pending"),
+                recipient("algiz", "pending"),
+                recipient("gone", "pending"),
+            ],
+        );
+        fs::write(dir.join("payload"), b"hello").unwrap();
+        let cfg = trusted_cfg(&["othala", "algiz"]);
+        let mut peers = || vec![online("othala"), online("algiz")];
+        let mut deliver = |d: &Delivery| -> Result<(), DeliverError> {
+            assert_eq!(d.payload, b"hello");
+            if d.peer.host == "othala" {
+                Ok(())
+            } else {
+                Err(DeliverError {
+                    message: "algiz is offline".into(),
+                    permanent: false,
+                })
+            }
+        };
+        let mut env = QueueEnv {
+            cfg: &cfg,
+            now,
+            peers: &mut peers,
+            deliver: &mut deliver,
+        };
+        process_queue(&out, &history, &mut env);
+        let meta = read_meta(&dir);
+        let by = |h: &str| meta.recipients.iter().find(|r| r.host == h).unwrap();
+        assert_eq!(by("othala").status, "delivered");
+        assert_eq!(by("algiz").status, "waiting");
+        assert_eq!(by("algiz").attempts, 1);
+        assert_eq!(by("algiz").last_error, "algiz is offline");
+        assert_eq!(by("gone").status, "rejected");
+        assert!(dir.join("payload").exists());
+
+        // A permanent failure makes every recipient final: archived, payload gone.
+        let mut peers = || vec![online("algiz")];
+        let mut deliver = |_: &Delivery| -> Result<(), DeliverError> {
+            Err(DeliverError {
+                message: "too large for algiz".into(),
+                permanent: true,
+            })
+        };
+        let mut env = QueueEnv {
+            cfg: &cfg,
+            now: now + 1000,
+            peers: &mut peers,
+            deliver: &mut deliver,
+        };
+        process_queue(&out, &history, &mut env);
+        assert!(!dir.exists());
+        let records = read_history(&history);
+        assert_eq!(records[0]["recipients"][1]["status"], "failed");
+    }
 
     #[test]
     fn transfer_ids_reject_paths_and_junk() {
