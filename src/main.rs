@@ -901,6 +901,7 @@ fn queue_worker(wake: Option<UnixDatagram>) {
                 peers: &mut peers,
                 deliver: &mut deliver,
                 contacts: Some(&contacts),
+                notify: notifications_enabled(),
             };
             deadline = process_queue(&state_dir().join("out"), &history_path(), &mut env);
         }
@@ -1089,6 +1090,8 @@ struct Delivery<'a> {
     peer: &'a Peer,
     token: &'a str,
     payload: &'a [u8],
+    /// The progress notification of a large item and this recipient's index.
+    progress: Option<(&'a ProgressNote, usize)>,
 }
 struct QueueEnv<'a> {
     cfg: &'a Config,
@@ -1098,6 +1101,8 @@ struct QueueEnv<'a> {
     deliver: &'a mut dyn FnMut(&Delivery) -> Result<(), DeliverError>,
     /// Where successful contacts are recorded (None in unit tests).
     contacts: Option<&'a Path>,
+    /// Show progress notifications for large items (off in unit tests).
+    notify: bool,
 }
 
 /// One pass over the outgoing queue. Final entries are archived without
@@ -1145,6 +1150,7 @@ fn process_queue(out: &Path, history: &Path, env: &mut QueueEnv) -> Option<u64> 
             continue;
         }
         let mut payload: Option<Vec<u8>> = None;
+        let mut note: Option<ProgressNote> = None;
         for i in 0..outgoing.recipients.len() {
             if is_final(&outgoing.recipients[i].status) {
                 continue;
@@ -1187,12 +1193,33 @@ fn process_queue(out: &Path, history: &Path, env: &mut QueueEnv) -> Option<u64> 
                     }
                 }
             }
+            let body = payload.as_deref().unwrap_or_default();
+            // Large items get one progress notification on their first try;
+            // retries stay quiet.
+            if note.is_none()
+                && env.notify
+                && body.len() > LARGE_BYTES
+                && outgoing.recipients[i].attempts == 0
+            {
+                note = Some(ProgressNote::start(&outgoing, body.len()));
+            }
             let result = (env.deliver)(&Delivery {
                 outgoing: &outgoing,
                 peer,
                 token: &trusted.token,
-                payload: payload.as_deref().unwrap_or_default(),
+                payload: body,
+                progress: note.as_ref().map(|n| (n, i)),
             });
+            if let Some(n) = &note {
+                n.set(
+                    i,
+                    match &result {
+                        Ok(()) => "delivered".into(),
+                        Err(e) => e.message.clone(),
+                    },
+                    true,
+                );
+            }
             let r = &mut outgoing.recipients[i];
             match result {
                 Ok(()) => {
@@ -1212,6 +1239,9 @@ fn process_queue(out: &Path, history: &Path, env: &mut QueueEnv) -> Option<u64> 
                 }
             }
             changed = true;
+        }
+        if let Some(n) = note {
+            n.finish(&outgoing);
         }
         if all_final(&outgoing) {
             let _ = archive(&path, history, &outgoing, env.now);
@@ -1270,18 +1300,207 @@ fn describe_failure(host: &str, err: &ureq::Error) -> DeliverError {
     DeliverError { message, permanent }
 }
 
+/// Per-operation timeouts instead of one total timeout: a large image on a
+/// slow link may take long, a stalled one fails within 30 s.
+fn http_agent() -> &'static ureq::Agent {
+    static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
+    AGENT.get_or_init(|| {
+        ureq::AgentBuilder::new()
+            .timeout_connect(Duration::from_secs(10))
+            .timeout_read(Duration::from_secs(30))
+            .timeout_write(Duration::from_secs(30))
+            .build()
+    })
+}
+
+/// Streams the payload and reports how much has been handed to the socket.
+struct ProgressReader<'a> {
+    data: &'a [u8],
+    sent: usize,
+    progress: Option<(&'a ProgressNote, usize)>,
+}
+impl Read for ProgressReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = buf.len().min(64 * 1024).min(self.data.len() - self.sent);
+        buf[..n].copy_from_slice(&self.data[self.sent..self.sent + n]);
+        self.sent += n;
+        if let Some((note, i)) = self.progress {
+            note.progress(i, self.sent, self.data.len());
+        }
+        Ok(n)
+    }
+}
+
 fn deliver_http(d: &Delivery) -> Result<(), DeliverError> {
     let url = format!("http://{}:{}/share", d.peer.ip, d.peer.port);
-    ureq::post(&url)
+    http_agent()
+        .post(&url)
         .set("Authorization", &format!("Bearer {}", d.token))
         .set("X-Nirushare-Transfer", &d.outgoing.id)
         .set("X-Nirushare-Kind", &d.outgoing.kind)
         .set("X-Nirushare-Name", &d.outgoing.name)
         .set("X-Nirushare-Digest", &d.outgoing.digest)
-        .timeout(Duration::from_secs(30))
-        .send_bytes(d.payload)
+        // Sized, not chunked: protocol 1 receivers expect Content-Length.
+        .set("Content-Length", &d.payload.len().to_string())
+        .send(ProgressReader {
+            data: d.payload,
+            sent: 0,
+            progress: d.progress,
+        })
         .map(|_| ())
         .map_err(|e| describe_failure(&d.peer.host, &e))
+}
+
+// ── Progress notifications for large items ─────────────────────────────────
+
+/// Items above this size show sending progress.
+const LARGE_BYTES: usize = 2 * 1024 * 1024;
+
+/// Whether notify-send can replace a notification in place (libnotify 0.8+:
+/// --print-id and --replace-id). Asked once per service.
+fn notify_can_replace() -> bool {
+    static CAN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CAN.get_or_init(|| {
+        Command::new("notify-send")
+            .arg("--help")
+            .output()
+            .map(|o| {
+                let help = String::from_utf8_lossy(&o.stdout);
+                help.contains("--replace-id") && help.contains("--print-id")
+            })
+            .unwrap_or(false)
+    })
+}
+
+/// One notification per large item, updated with each recipient's progress
+/// where notify-send supports replacing; otherwise shown at start and end.
+struct ProgressNote {
+    summary: String,
+    lines: std::cell::RefCell<Vec<(String, String)>>,
+    shown: std::cell::Cell<Option<std::time::Instant>>,
+    last_pct: std::cell::RefCell<Vec<usize>>,
+    id: std::cell::RefCell<String>,
+    replace: bool,
+    /// Unit tests record the notifications instead of showing them.
+    #[cfg(test)]
+    log: std::cell::RefCell<Vec<(String, String)>>,
+}
+impl ProgressNote {
+    fn start(o: &Outgoing, size: usize) -> Self {
+        Self::start_with(o, size, notify_can_replace())
+    }
+    fn start_with(o: &Outgoing, size: usize, replace: bool) -> Self {
+        let mb = size as f64 / (1024.0 * 1024.0);
+        let note = ProgressNote {
+            summary: format!("Sending {} ({mb:.1} MB)", o.name),
+            lines: std::cell::RefCell::new(
+                o.recipients
+                    .iter()
+                    .map(|r| {
+                        let state = if is_final(&r.status) {
+                            r.status.clone()
+                        } else {
+                            "queued".into()
+                        };
+                        (short_host(&r.host).to_string(), state)
+                    })
+                    .collect(),
+            ),
+            shown: std::cell::Cell::new(None),
+            last_pct: std::cell::RefCell::new(vec![0; o.recipients.len()]),
+            id: std::cell::RefCell::new(String::new()),
+            replace,
+            #[cfg(test)]
+            log: Default::default(),
+        };
+        note.show(&note.summary);
+        note
+    }
+    fn body(&self) -> String {
+        self.lines
+            .borrow()
+            .iter()
+            .map(|(h, s)| format!("{h}: {s}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+    fn show(&self, summary: &str) {
+        self.shown.set(Some(std::time::Instant::now()));
+        #[cfg(test)]
+        {
+            self.log
+                .borrow_mut()
+                .push((summary.to_string(), self.body()));
+            return;
+        }
+        #[allow(unreachable_code)]
+        let mut cmd = Command::new("notify-send");
+        cmd.args(["--app-name", "NIRU Share"]);
+        if self.replace {
+            cmd.arg("--print-id");
+            let id = self.id.borrow().clone();
+            if !id.is_empty() {
+                cmd.args(["--replace-id", &id]);
+            }
+        }
+        cmd.args([summary, &self.body()]);
+        if let Ok(out) = cmd.output() {
+            let id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if self.replace && !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()) {
+                *self.id.borrow_mut() = id;
+            }
+        }
+    }
+    /// Update one recipient's line; `force` shows it even between steps.
+    fn set(&self, i: usize, state: String, force: bool) {
+        if let Some(line) = self.lines.borrow_mut().get_mut(i) {
+            line.1 = state;
+        }
+        let due = self
+            .shown
+            .get()
+            .is_none_or(|t| t.elapsed() >= Duration::from_millis(500));
+        if self.replace && (force || due) {
+            self.show(&self.summary);
+        }
+    }
+    /// Called while streaming: updates at most every 10 % and 0.5 s.
+    fn progress(&self, i: usize, sent: usize, total: usize) {
+        let pct = sent * 100 / total.max(1);
+        let step = {
+            let mut last = self.last_pct.borrow_mut();
+            let Some(prev) = last.get_mut(i) else {
+                return;
+            };
+            if pct < *prev + 10 || pct >= 100 {
+                return;
+            }
+            *prev = pct - pct % 10;
+            *prev
+        };
+        self.set(i, format!("sending {step} %"), false);
+    }
+    fn finish(&self, o: &Outgoing) {
+        {
+            let mut lines = self.lines.borrow_mut();
+            for (line, r) in lines.iter_mut().zip(&o.recipients) {
+                line.1 = match r.status.as_str() {
+                    "waiting" if !r.last_error.is_empty() => {
+                        format!("will retry · {}", r.last_error)
+                    }
+                    "waiting" => "will retry".into(),
+                    other => other.into(),
+                };
+            }
+        }
+        let done = o.recipients.iter().all(|r| r.status == "delivered");
+        let summary = if done {
+            format!("Sent {}", o.name)
+        } else {
+            format!("Sending {}", o.name)
+        };
+        self.show(&summary);
+    }
 }
 
 // ── Contacts and status ────────────────────────────────────────────────────
@@ -2124,6 +2343,7 @@ mod tests {
             peers: &mut peers,
             deliver: &mut deliver,
             contacts: None,
+            notify: false,
         };
         process_queue(&out, &history, &mut env);
         assert!(!done.exists(), "final entry and its payload are removed");
@@ -2154,6 +2374,7 @@ mod tests {
             peers: &mut peers,
             deliver: &mut deliver,
             contacts: None,
+            notify: false,
         };
         process_queue(&out, &history, &mut env);
         assert_eq!(read_meta(&waiting).recipients[0].status, "waiting");
@@ -2195,6 +2416,7 @@ mod tests {
             peers: &mut peers,
             deliver: &mut deliver,
             contacts: None,
+            notify: false,
         };
         process_queue(&out, &history, &mut env);
         let meta = read_meta(&dir);
@@ -2220,6 +2442,7 @@ mod tests {
             peers: &mut peers,
             deliver: &mut deliver,
             contacts: None,
+            notify: false,
         };
         process_queue(&out, &history, &mut env);
         assert!(!dir.exists());
@@ -2246,6 +2469,7 @@ mod tests {
             peers: &mut peers,
             deliver: &mut deliver,
             contacts: None,
+            notify: false,
         };
         process_queue(&out, &history, &mut env);
         assert_eq!(read_meta(&fresh).created, mtime);
@@ -2256,6 +2480,7 @@ mod tests {
             peers: &mut peers,
             deliver: &mut deliver,
             contacts: None,
+            notify: false,
         };
         process_queue(&out, &history, &mut env);
         assert!(!fresh.exists() && !old.exists());
@@ -2296,6 +2521,7 @@ mod tests {
                 peers: &mut peers,
                 deliver: &mut deliver,
                 contacts: None,
+                notify: false,
             };
             process_queue(&out, &history, &mut env)
         };
@@ -2338,6 +2564,7 @@ mod tests {
             peers: &mut peers,
             deliver: &mut deliver,
             contacts: None,
+            notify: false,
         };
         assert_eq!(process_queue(&out, &root.join("h"), &mut env), None);
     }
@@ -2455,6 +2682,7 @@ mod tests {
             peers: &mut peers,
             deliver: &mut deliver,
             contacts: Some(&contacts),
+            notify: false,
         };
         process_queue(&out, &history, &mut env);
         record_contact(&contacts, "algiz.tail.ts.net", "received", now - 7200);
@@ -2566,6 +2794,62 @@ mod tests {
         assert!(foreign.exists() && fs::symlink_metadata(&link).is_ok());
         let left: Vec<_> = load_inbox(&inbox).into_iter().map(|i| i.id).collect();
         assert_eq!(left, ["4-d"]);
+    }
+
+    #[test]
+    fn large_items_update_one_progress_notification() {
+        let o = Outgoing {
+            id: "9-big".into(),
+            kind: "image".into(),
+            name: "big.png".into(),
+            digest: String::new(),
+            created: 1,
+            recipients: vec![
+                recipient("othala.ts.net", "pending"),
+                recipient("void", "pending"),
+            ],
+        };
+        let total = 3 * 1024 * 1024;
+        let note = ProgressNote::start_with(&o, total, true);
+        std::thread::sleep(Duration::from_millis(600));
+        for sent in (0..=total).step_by(64 * 1024) {
+            note.progress(0, sent, total);
+        }
+        note.set(0, "delivered".into(), true);
+        std::thread::sleep(Duration::from_millis(600));
+        note.progress(1, total / 2, total);
+        note.set(1, "void is offline".into(), true);
+        let mut done = o;
+        done.recipients[0].status = "delivered".into();
+        done.recipients[1].status = "waiting".into();
+        done.recipients[1].last_error = "void is offline".into();
+        note.finish(&done);
+        let log = note.log.borrow().clone();
+        assert_eq!(log[0].0, "Sending big.png (3.0 MB)");
+        assert_eq!(log[0].1, "othala: queued\nvoid: queued");
+        assert!(log
+            .iter()
+            .any(|(_, b)| b.starts_with("othala: sending 10 %")));
+        assert!(log.iter().any(|(_, b)| b.contains("void: sending 50 %")));
+        // Rate-limited: far fewer updates than the 49 chunks streamed.
+        assert!(log.len() <= 8, "{} updates", log.len());
+        let last = log.last().unwrap();
+        assert_eq!(last.0, "Sending big.png");
+        assert_eq!(
+            last.1,
+            "othala: delivered\nvoid: will retry · void is offline"
+        );
+
+        // Without replace support: only the start and the end.
+        let note = ProgressNote::start_with(&done, total, false);
+        for sent in (0..=total).step_by(64 * 1024) {
+            note.progress(0, sent, total);
+        }
+        note.set(0, "delivered".into(), true);
+        assert_eq!(note.log.borrow().len(), 1);
+        done.recipients[1].status = "delivered".into();
+        note.finish(&done);
+        assert_eq!(note.log.borrow()[1].0, "Sent big.png");
     }
 
     #[test]

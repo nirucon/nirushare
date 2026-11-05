@@ -228,6 +228,49 @@ fn two_local_instances_exchange_text_and_images() {
     assert_eq!(beta.queue_len(), 0);
     assert_eq!(item["sender"], "beta");
 
+    // A large image is streamed with a fixed Content-Length.
+    let mut big = PNG.to_vec();
+    big.resize(3 * 1024 * 1024 + 17, 7);
+    let big_path = beta.root.join("big.png");
+    std::fs::write(&big_path, &big).unwrap();
+    beta.run(
+        &[
+            "send",
+            "--to",
+            "alpha",
+            "--file",
+            big_path.to_str().unwrap(),
+        ],
+        None,
+    );
+    wait_for(Duration::from_secs(10), || beta.queue_len() == 0);
+    let got = alpha
+        .inbox()
+        .into_iter()
+        .filter(|i| i["kind"] == "image")
+        .count();
+    assert_eq!(got, 2);
+    let big_item = alpha
+        .inbox()
+        .into_iter()
+        .find(|i| {
+            i["kind"] == "image"
+                && std::fs::metadata(i["path"].as_str().unwrap())
+                    .ok()
+                    .map(|m| m.len())
+                    == Some(big.len() as u64)
+        })
+        .expect("the large image arrived");
+    assert!(std::fs::read(big_item["path"].as_str().unwrap()).unwrap() == big);
+    std::fs::remove_file(big_item["path"].as_str().unwrap()).unwrap();
+    std::fs::remove_file(
+        alpha
+            .root
+            .join("data/nirushare/inbox")
+            .join(format!("{}.json", big_item["id"].as_str().unwrap())),
+    )
+    .unwrap();
+
     // A stalled sender holds one worker until its body deadline, while
     // other transfers keep flowing.
     let mut stalled = TcpStream::connect(("127.0.0.1", pb)).unwrap();
