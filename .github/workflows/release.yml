@@ -1,0 +1,46 @@
+name: Release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: write
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with: { targets: x86_64-unknown-linux-musl, components: "rustfmt, clippy" }
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: cargo fmt --check && cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked && cargo test --locked --features test-transport
+      # A static binary keeps one artifact valid on Arch, Debian and Void.
+      # Release builds never enable the test-transport feature.
+      - run: cargo build --release --locked --target x86_64-unknown-linux-musl
+      - run: |
+          bin=target/x86_64-unknown-linux-musl/release/nirushare
+          test "$($bin --version)" = "NIRUSHARE ${GITHUB_REF_NAME#v}"
+          file $bin | grep -q 'statically linked'
+          ! grep -q NIRUSHARE_TEST_ $bin
+      # The checksums are generated here from the published binary; nothing
+      # in the repository is reused.
+      - run: |
+          mkdir -p dist
+          cp target/x86_64-unknown-linux-musl/release/nirushare dist/
+          cd dist && sha256sum nirushare > SHA256SUMS && cat SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with: { name: dist, path: dist }
+  publish-release:
+    needs: publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { name: dist, path: dist }
+      - run: cd dist && sha256sum -c SHA256SUMS
+      - uses: softprops/action-gh-release@v2
+        with:
+          make_latest: true
+          files: |
+            dist/nirushare
+            dist/SHA256SUMS
+          generate_release_notes: true
