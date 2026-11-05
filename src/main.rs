@@ -567,6 +567,16 @@ fn is_final(status: &str) -> bool {
 fn all_final(outgoing: &Outgoing) -> bool {
     outgoing.recipients.iter().all(|r| is_final(&r.status))
 }
+fn entry_mtime(path: &Path) -> Option<u64> {
+    fs::metadata(path)
+        .ok()?
+        .modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs())
+        .filter(|&s| s > 0)
+}
 fn history_path() -> PathBuf {
     state_dir().join("history.jsonl")
 }
@@ -661,11 +671,17 @@ fn process_queue(out: &Path, history: &Path, env: &mut QueueEnv) {
         let Ok(mut outgoing) = serde_json::from_slice::<Outgoing>(&meta_bytes) else {
             continue;
         };
+        let mut changed = outgoing.recipients.iter().any(|r| !r.token.is_empty());
+        if outgoing.created == 0 {
+            // Entries written before `created` existed: date them by their
+            // directory once, so expiry applies to them too.
+            outgoing.created = entry_mtime(&path).unwrap_or(env.now);
+            changed = true;
+        }
         if all_final(&outgoing) {
             let _ = archive(&path, history, &outgoing, env.now);
             continue;
         }
-        let mut changed = outgoing.recipients.iter().any(|r| !r.token.is_empty());
         if outgoing.created > 0 && env.now.saturating_sub(outgoing.created) > EXPIRY_SECS {
             for r in &mut outgoing.recipients {
                 if !is_final(&r.status) {
@@ -1259,6 +1275,44 @@ mod tests {
         assert!(!dir.exists());
         let records = read_history(&history);
         assert_eq!(records[0]["recipients"][1]["status"], "failed");
+    }
+
+    #[test]
+    fn legacy_entries_without_created_expire_by_directory_age() {
+        let root = temp_dir("legacy");
+        let out = root.join("out");
+        let history = root.join("history.jsonl");
+        let fresh = queue_entry(&out, "4-fresh", 0, vec![recipient("void", "waiting")]);
+        let old = queue_entry(&out, "5-old", 0, vec![recipient("void", "waiting")]);
+        unreadable_payload(&old);
+        let mtime = entry_mtime(&fresh).unwrap();
+        let cfg = trusted_cfg(&["void"]);
+        let mut peers = || vec![];
+        let mut deliver = |_: &Delivery| -> Result<(), DeliverError> { panic!("no send") };
+        // Shortly after: the fresh entry gets its directory time written back once.
+        let mut env = QueueEnv {
+            cfg: &cfg,
+            now: mtime + 60,
+            peers: &mut peers,
+            deliver: &mut deliver,
+        };
+        process_queue(&out, &history, &mut env);
+        assert_eq!(read_meta(&fresh).created, mtime);
+        // Past the expiry window, both legacy entries expire and are archived.
+        let mut env = QueueEnv {
+            cfg: &cfg,
+            now: mtime + EXPIRY_SECS + 61,
+            peers: &mut peers,
+            deliver: &mut deliver,
+        };
+        process_queue(&out, &history, &mut env);
+        assert!(!fresh.exists() && !old.exists());
+        let records = read_history(&history);
+        assert_eq!(records.len(), 2);
+        for r in &records {
+            assert_eq!(r["recipients"][0]["status"], "expired");
+            assert!(r["created"].as_u64().unwrap() > 0);
+        }
     }
 
     #[test]
