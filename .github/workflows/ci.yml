@@ -1,0 +1,27 @@
+name: CI
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+      - run: cargo build --release --locked
+      - run: test "$(target/release/nirushare --version)" = "NIRUSHARE $(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+
+  # Locked builds and tests on the declared rust-version, which is also
+  # Debian 13's rustc.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.85"
+      - run: cargo build --locked --all-targets
+      - run: cargo test --locked

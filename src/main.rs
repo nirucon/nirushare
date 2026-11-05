@@ -896,6 +896,43 @@ fn url_encode(s: &str) -> String {
         })
         .collect()
 }
+fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let result = match args.first().map(String::as_str) {
+        Some("--version") => {
+            println!("NIRUSHARE {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
+        Some("--help") | None => {
+            println!("NIRUSHARE {}\nUsage: nirushare serve|devices|trust HOST TOKEN|revoke HOST|token|send --to HOST|--all|--file PATH|inbox|status|copy ID|open ID|email", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
+        Some("serve") => serve(),
+        Some("devices") => list_devices(),
+        Some("token") => {
+            println!("{}", token());
+            Ok(())
+        }
+        Some("trust") if args.len() == 2 => {
+            let value = std::env::var("NIRUSHARE_TOKEN").unwrap_or_default();
+            trust(&args[1], &value)
+        }
+        Some("trust") if args.len() == 3 => trust(&args[1], &args[2]),
+        Some("revoke") if args.len() == 2 => revoke(&args[1]),
+        Some("send") => send(&args[1..]),
+        Some("inbox") => list_inbox(),
+        Some("status") => status(),
+        Some("copy") if args.len() == 2 => copy_item(&args[1]),
+        Some("open") if args.len() == 2 => open_item(&args[1]),
+        Some("email") => email(),
+        Some(other) => Err(format!("unknown command: {other}")),
+    };
+    if let Err(e) = result {
+        eprintln!("nirushare: {e}");
+        std::process::exit(1);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -932,42 +969,5 @@ mod tests {
     fn encoding_is_utf8_and_percent_safe() {
         assert_eq!(url_encode("NIRU Share"), "NIRU%20Share");
         assert_eq!(url_encode("åäö"), "%C3%A5%C3%A4%C3%B6");
-    }
-}
-
-fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let result = match args.first().map(String::as_str) {
-        Some("--version") => {
-            println!("NIRUSHARE {}", env!("CARGO_PKG_VERSION"));
-            Ok(())
-        }
-        Some("--help") | None => {
-            println!("NIRUSHARE {}\nUsage: nirushare serve|devices|trust HOST TOKEN|revoke HOST|token|send --to HOST|--all|--file PATH|inbox|status|copy ID|open ID|email", env!("CARGO_PKG_VERSION"));
-            Ok(())
-        }
-        Some("serve") => serve(),
-        Some("devices") => list_devices(),
-        Some("token") => {
-            println!("{}", token());
-            Ok(())
-        }
-        Some("trust") if args.len() == 2 => {
-            let value = std::env::var("NIRUSHARE_TOKEN").unwrap_or_default();
-            trust(&args[1], &value)
-        }
-        Some("trust") if args.len() == 3 => trust(&args[1], &args[2]),
-        Some("revoke") if args.len() == 2 => revoke(&args[1]),
-        Some("send") => send(&args[1..]),
-        Some("inbox") => list_inbox(),
-        Some("status") => status(),
-        Some("copy") if args.len() == 2 => copy_item(&args[1]),
-        Some("open") if args.len() == 2 => open_item(&args[1]),
-        Some("email") => email(),
-        Some(other) => Err(format!("unknown command: {other}")),
-    };
-    if let Err(e) = result {
-        eprintln!("nirushare: {e}");
-        std::process::exit(1);
     }
 }
