@@ -4,6 +4,7 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
@@ -42,6 +43,12 @@ struct Recipient {
     status: String,
     attempts: u32,
     last_error: String,
+    /// Unix time of the next attempt; 0 means as soon as possible.
+    #[serde(default)]
+    next_attempt: u64,
+    /// Consecutive unsuccessful passes (offline or failed), for backoff.
+    #[serde(default)]
+    backoff: u32,
 }
 #[derive(Serialize, Deserialize, Clone)]
 struct InboxItem {
@@ -519,7 +526,14 @@ fn serve() -> Result<(), String> {
     }
     let addr = format!("{}:{}", own.ip, PORT);
     let server = tiny_http::Server::http(&addr).map_err(|e| format!("bind {addr}: {e}"))?;
-    thread::spawn(queue_worker);
+    let wake = match bind_wake() {
+        Ok(sock) => Some(sock),
+        Err(e) => {
+            eprintln!("nirushare: no wake socket ({e}); checking the queue every minute");
+            None
+        }
+    };
+    thread::spawn(move || queue_worker(wake));
     eprintln!("nirushare listening on {addr}");
     for request in server.incoming_requests() {
         if request.method() == &tiny_http::Method::Get && request.url() == "/health" {
@@ -540,8 +554,12 @@ fn serve() -> Result<(), String> {
     Ok(())
 }
 
-fn queue_worker() {
+/// The queue worker sleeps until the next retry or expiry is due, or until
+/// `nirushare send` wakes it through the wake socket. With nothing pending
+/// it blocks indefinitely: no timer, no Tailscale query, no spawn.
+fn queue_worker(wake: Option<UnixDatagram>) {
     loop {
+        let mut deadline = None;
         if let Ok(cfg) = load_config() {
             let mut peers = || tailscale().map(|(_, p)| p).unwrap_or_default();
             let mut deliver = deliver_http;
@@ -551,10 +569,69 @@ fn queue_worker() {
                 peers: &mut peers,
                 deliver: &mut deliver,
             };
-            process_queue(&state_dir().join("out"), &history_path(), &mut env);
+            deadline = process_queue(&state_dir().join("out"), &history_path(), &mut env);
         }
-        thread::sleep(Duration::from_secs(5));
+        let wait = deadline.map(|d| Duration::from_secs(d.saturating_sub(now_secs()).max(1)));
+        match &wake {
+            Some(sock) => wait_for_wake(sock, wait),
+            // Without a wake socket new items are only noticed by a slow timer.
+            None => thread::sleep(wait.unwrap_or(WAKELESS_IDLE).min(WAKELESS_IDLE)),
+        }
     }
+}
+const WAKELESS_IDLE: Duration = Duration::from_secs(60);
+
+fn runtime_dir() -> PathBuf {
+    match std::env::var_os("XDG_RUNTIME_DIR") {
+        Some(v) if !v.is_empty() => PathBuf::from(v).join("nirushare"),
+        _ => state_dir(),
+    }
+}
+fn wake_path() -> PathBuf {
+    runtime_dir().join("wake")
+}
+fn bind_wake() -> Result<UnixDatagram, String> {
+    use std::os::unix::fs::FileTypeExt;
+    let path = wake_path();
+    private_dir(&runtime_dir())?;
+    if let Ok(meta) = fs::symlink_metadata(&path) {
+        if meta.file_type().is_socket() {
+            let _ = fs::remove_file(&path);
+        }
+    }
+    let sock = UnixDatagram::bind(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    private_file(&path)?;
+    Ok(sock)
+}
+/// Block until a wake datagram arrives or `wait` passes (None: no timeout).
+/// The datagram content is ignored; it only triggers a queue pass.
+fn wait_for_wake(sock: &UnixDatagram, wait: Option<Duration>) {
+    let mut buf = [0u8; 16];
+    let _ = sock.set_read_timeout(wait);
+    let _ = sock.recv(&mut buf);
+    // Several sends may have woken us; one pass handles them all.
+    if sock.set_nonblocking(true).is_ok() {
+        while sock.recv(&mut buf).is_ok() {}
+        let _ = sock.set_nonblocking(false);
+    }
+}
+/// Tell a running service that the queue changed. Missing service: no-op.
+fn wake_service() {
+    if let Ok(sock) = UnixDatagram::unbound() {
+        let _ = sock.send_to(b"q", wake_path());
+    }
+}
+
+/// Retry delay after `n` consecutive unsuccessful passes: 5 s doubling to 5 min.
+fn backoff_secs(n: u32) -> u64 {
+    if n == 0 {
+        return 0;
+    }
+    (5u64 << (n - 1).min(16)).min(300)
+}
+fn schedule_retry(r: &mut Recipient, now: u64) {
+    r.backoff = r.backoff.saturating_add(1);
+    r.next_attempt = now + backoff_secs(r.backoff);
 }
 
 /// A recipient in one of these states is never sent to again.
@@ -654,10 +731,13 @@ struct QueueEnv<'a> {
 /// One pass over the outgoing queue. Final entries are archived without
 /// their payload ever being read; the payload is read only right before a
 /// send attempt.
-fn process_queue(out: &Path, history: &Path, env: &mut QueueEnv) {
+/// Returns the Unix time of the next due retry or expiry, or None when no
+/// recipient is pending.
+fn process_queue(out: &Path, history: &Path, env: &mut QueueEnv) -> Option<u64> {
     let Ok(entries) = fs::read_dir(out) else {
-        return;
+        return None;
     };
+    let mut deadline: Option<u64> = None;
     let mut peers: Option<Vec<Peer>> = None;
     for entry in entries.flatten() {
         let path = entry.path();
@@ -697,6 +777,9 @@ fn process_queue(out: &Path, history: &Path, env: &mut QueueEnv) {
             if is_final(&outgoing.recipients[i].status) {
                 continue;
             }
+            if outgoing.recipients[i].next_attempt > env.now {
+                continue;
+            }
             let host = outgoing.recipients[i].host.clone();
             let Some(trusted) = env.cfg.trusted.iter().find(|t| t.host == host) else {
                 let r = &mut outgoing.recipients[i];
@@ -709,10 +792,9 @@ fn process_queue(out: &Path, history: &Path, env: &mut QueueEnv) {
             let peer = find_peer(peers, &host).filter(|p| p.online && !p.ip.is_empty());
             let Some(peer) = peer else {
                 let r = &mut outgoing.recipients[i];
-                if r.status != "waiting" {
-                    r.status = "waiting".into();
-                    changed = true;
-                }
+                r.status = "waiting".into();
+                schedule_retry(r, env.now);
+                changed = true;
                 continue;
             };
             if payload.is_none() {
@@ -738,21 +820,32 @@ fn process_queue(out: &Path, history: &Path, env: &mut QueueEnv) {
                 Ok(()) => {
                     r.status = "delivered".into();
                     r.last_error.clear();
+                    r.backoff = 0;
+                    r.next_attempt = 0;
                 }
                 Err(e) => {
                     r.attempts += 1;
                     r.last_error = e.message;
                     r.status = if e.permanent { "failed" } else { "waiting" }.into();
+                    schedule_retry(r, env.now);
                 }
             }
             changed = true;
         }
         if all_final(&outgoing) {
             let _ = archive(&path, history, &outgoing, env.now);
-        } else if changed {
+            continue;
+        }
+        if changed {
             let _ = write_meta(&path, &outgoing);
         }
+        let expiry = outgoing.created + EXPIRY_SECS + 1;
+        for r in outgoing.recipients.iter().filter(|r| !is_final(&r.status)) {
+            let due = r.next_attempt.max(env.now).min(expiry);
+            deadline = Some(deadline.map_or(due, |d: u64| d.min(due)));
+        }
     }
+    deadline
 }
 
 fn deliver_http(d: &Delivery) -> Result<(), DeliverError> {
@@ -814,6 +907,8 @@ fn send(args: &[String]) -> Result<(), String> {
                     status: "pending".into(),
                     attempts: 0,
                     last_error: String::new(),
+                    next_attempt: 0,
+                    backoff: 0,
                 });
                 i += 2;
             }
@@ -838,6 +933,8 @@ fn send(args: &[String]) -> Result<(), String> {
                 status: "pending".into(),
                 attempts: 0,
                 last_error: String::new(),
+                next_attempt: 0,
+                backoff: 0,
             });
         }
     }
@@ -862,8 +959,9 @@ fn send(args: &[String]) -> Result<(), String> {
     };
     let id = now_id();
     let dir = state_dir().join("out").join(&id);
-    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    private_dir(&dir)?;
     fs::write(dir.join("payload"), &payload).map_err(|e| e.to_string())?;
+    private_file(&dir.join("payload"))?;
     let outgoing = Outgoing {
         id: id.clone(),
         kind,
@@ -872,11 +970,8 @@ fn send(args: &[String]) -> Result<(), String> {
         created: now_secs(),
         recipients,
     };
-    fs::write(
-        dir.join("meta.json"),
-        serde_json::to_vec_pretty(&outgoing).map_err(|e| e.to_string())?,
-    )
-    .map_err(|e| e.to_string())?;
+    write_meta(&dir, &outgoing)?;
+    wake_service();
     println!("{id}");
     Ok(())
 }
@@ -1102,6 +1197,8 @@ mod tests {
             status: status.into(),
             attempts: 0,
             last_error: String::new(),
+            next_attempt: 0,
+            backoff: 0,
         }
     }
     fn queue_entry(out: &Path, id: &str, created: u64, recipients: Vec<Recipient>) -> PathBuf {
@@ -1313,6 +1410,96 @@ mod tests {
             assert_eq!(r["recipients"][0]["status"], "expired");
             assert!(r["created"].as_u64().unwrap() > 0);
         }
+    }
+
+    #[test]
+    fn backoff_doubles_from_five_seconds_to_five_minutes() {
+        let seq: Vec<u64> = (0..10).map(backoff_secs).collect();
+        assert_eq!(seq, [0, 5, 10, 20, 40, 80, 160, 300, 300, 300]);
+        assert_eq!(backoff_secs(u32::MAX), 300);
+    }
+
+    #[test]
+    fn offline_recipients_back_off_and_query_tailscale_once_per_pass() {
+        let root = temp_dir("backoff");
+        let out = root.join("out");
+        let history = root.join("history.jsonl");
+        let now = 1_800_000_000;
+        let a = queue_entry(&out, "6-a", now, vec![recipient("void", "pending")]);
+        let b = queue_entry(&out, "7-b", now, vec![recipient("void", "pending")]);
+        let cfg = trusted_cfg(&["void"]);
+        let calls = std::cell::Cell::new(0);
+        let mut peers = || {
+            calls.set(calls.get() + 1);
+            vec![]
+        };
+        let mut deliver = |_: &Delivery| -> Result<(), DeliverError> { panic!("offline") };
+        let mut pass = |at: u64| {
+            let mut env = QueueEnv {
+                cfg: &cfg,
+                now: at,
+                peers: &mut peers,
+                deliver: &mut deliver,
+            };
+            process_queue(&out, &history, &mut env)
+        };
+        assert_eq!(pass(now), Some(now + 5));
+        assert_eq!(calls.get(), 1, "one Tailscale query for two entries");
+        // Not due yet: no query at all.
+        assert_eq!(pass(now + 4), Some(now + 5));
+        assert_eq!(calls.get(), 1);
+        assert_eq!(pass(now + 5), Some(now + 15));
+        assert_eq!(pass(now + 15), Some(now + 35));
+        assert_eq!(calls.get(), 3);
+        let r = &read_meta(&a).recipients[0];
+        assert_eq!(
+            (r.status.as_str(), r.backoff, r.next_attempt),
+            ("waiting", 3, now + 35)
+        );
+        assert_eq!(read_meta(&b).recipients[0].backoff, 3);
+        // Far in the backoff the delay is capped at five minutes.
+        let mut at = now + 35;
+        let mut gap = 0;
+        for _ in 0..10 {
+            let next = pass(at).unwrap();
+            gap = next - at;
+            at = next;
+        }
+        assert_eq!(gap, 300);
+    }
+
+    #[test]
+    fn an_empty_queue_has_no_deadline() {
+        let root = temp_dir("empty");
+        let out = root.join("out");
+        fs::create_dir_all(&out).unwrap();
+        let cfg = trusted_cfg(&[]);
+        let mut peers = || -> Vec<Peer> { panic!("no Tailscale query when idle") };
+        let mut deliver = |_: &Delivery| -> Result<(), DeliverError> { panic!("no send") };
+        let mut env = QueueEnv {
+            cfg: &cfg,
+            now: 1,
+            peers: &mut peers,
+            deliver: &mut deliver,
+        };
+        assert_eq!(process_queue(&out, &root.join("h"), &mut env), None);
+    }
+
+    #[test]
+    fn wake_socket_ends_the_idle_wait() {
+        let root = temp_dir("wake");
+        let path = root.join("wake");
+        let sock = UnixDatagram::bind(&path).unwrap();
+        let sender = UnixDatagram::unbound().unwrap();
+        sender.send_to(b"q", &path).unwrap();
+        sender.send_to(b"q", &path).unwrap();
+        let start = std::time::Instant::now();
+        wait_for_wake(&sock, Some(Duration::from_secs(30)));
+        assert!(start.elapsed() < Duration::from_secs(2));
+        // Both datagrams were drained: the next wait times out.
+        let start = std::time::Instant::now();
+        wait_for_wake(&sock, Some(Duration::from_millis(200)));
+        assert!(start.elapsed() >= Duration::from_millis(150));
     }
 
     #[test]
