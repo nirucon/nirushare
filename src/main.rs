@@ -772,6 +772,7 @@ fn commit_share(
     )
     .map_err(io)?;
     private_file(&dedup).map_err(|e| http_err(500, e))?;
+    record_contact(&contacts_path(), sender, "received", stamp);
     incoming_notice(&item);
     Ok("{\"ok\":true}")
 }
@@ -891,13 +892,15 @@ fn queue_worker(wake: Option<UnixDatagram>) {
         }
         let mut deadline = None;
         if let Ok(cfg) = load_config() {
-            let mut peers = || tailscale().map(|(_, p)| p).unwrap_or_default();
+            let mut peers = || tailscale().map(|(_, p)| p);
             let mut deliver = deliver_http;
+            let contacts = contacts_path();
             let mut env = QueueEnv {
                 cfg: &cfg,
                 now: now_secs(),
                 peers: &mut peers,
                 deliver: &mut deliver,
+                contacts: Some(&contacts),
             };
             deadline = process_queue(&state_dir().join("out"), &history_path(), &mut env);
         }
@@ -1068,7 +1071,6 @@ fn archive(dir: &Path, history: &Path, outgoing: &Outgoing, now: u64) -> Result<
     // the private queue and its name was validated as a transfer id.
     fs::remove_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))
 }
-#[cfg(test)]
 fn read_history(history: &Path) -> Vec<serde_json::Value> {
     fs::read_to_string(history)
         .unwrap_or_default()
@@ -1091,8 +1093,11 @@ struct Delivery<'a> {
 struct QueueEnv<'a> {
     cfg: &'a Config,
     now: u64,
-    peers: &'a mut dyn FnMut() -> Vec<Peer>,
+    /// Tailscale peers; Err when Tailscale cannot be asked.
+    peers: &'a mut dyn FnMut() -> Result<Vec<Peer>, String>,
     deliver: &'a mut dyn FnMut(&Delivery) -> Result<(), DeliverError>,
+    /// Where successful contacts are recorded (None in unit tests).
+    contacts: Option<&'a Path>,
 }
 
 /// One pass over the outgoing queue. Final entries are archived without
@@ -1105,7 +1110,7 @@ fn process_queue(out: &Path, history: &Path, env: &mut QueueEnv) -> Option<u64> 
         return None;
     };
     let mut deadline: Option<u64> = None;
-    let mut peers: Option<Vec<Peer>> = None;
+    let mut peers: Option<Result<Vec<Peer>, String>> = None;
     for entry in entries.flatten() {
         let path = entry.path();
         let name = entry.file_name();
@@ -1156,10 +1161,16 @@ fn process_queue(out: &Path, history: &Path, env: &mut QueueEnv) -> Option<u64> 
                 continue;
             };
             let peers = peers.get_or_insert_with(|| (env.peers)());
-            let peer = find_peer(peers, &host).filter(|p| p.online && !p.ip.is_empty());
-            let Some(peer) = peer else {
+            let known = peers.as_ref().ok().and_then(|p| find_peer(p, &host));
+            let Some(peer) = known.filter(|p| p.online && !p.ip.is_empty()) else {
+                let short = short_host(&host);
                 let r = &mut outgoing.recipients[i];
                 r.status = "waiting".into();
+                r.last_error = match (&peers, known) {
+                    (Err(_), _) => "Tailscale is not running on this device".into(),
+                    (_, None) => format!("{short} is not in this tailnet"),
+                    _ => format!("{short} is offline"),
+                };
                 schedule_retry(r, env.now);
                 changed = true;
                 continue;
@@ -1189,6 +1200,9 @@ fn process_queue(out: &Path, history: &Path, env: &mut QueueEnv) -> Option<u64> 
                     r.last_error.clear();
                     r.backoff = 0;
                     r.next_attempt = 0;
+                    if let Some(contacts) = env.contacts {
+                        record_contact(contacts, &host, "sent", env.now);
+                    }
                 }
                 Err(e) => {
                     r.attempts += 1;
@@ -1215,6 +1229,47 @@ fn process_queue(out: &Path, history: &Path, env: &mut QueueEnv) -> Option<u64> 
     deadline
 }
 
+fn short_host(host: &str) -> &str {
+    host.split('.').next().unwrap_or(host)
+}
+
+/// Turn a failed attempt into words for `nirushare status`, and decide
+/// whether retrying can help.
+fn describe_failure(host: &str, err: &ureq::Error) -> DeliverError {
+    let h = short_host(host);
+    let (message, permanent) = match err {
+        ureq::Error::Status(code, _) => match code {
+            401 => (format!("not trusted on {h}"), false),
+            403 => (
+                format!("{h} could not verify this device through Tailscale"),
+                false,
+            ),
+            408 => (format!("{h} timed out while receiving"), false),
+            409 => (
+                format!("{h} already has a different transfer with this id"),
+                true,
+            ),
+            413 => (format!("too large for {h}"), true),
+            415 => (format!("{h} does not accept this content"), true),
+            503 => (format!("{h} is busy"), false),
+            // 0.2.x receivers answer 500 to every rejection.
+            500 => (
+                format!("{h} refused it (not paired there, or an error)"),
+                false,
+            ),
+            _ => (format!("{h} answered HTTP {code}"), false),
+        },
+        ureq::Error::Transport(t) => match t.kind() {
+            ureq::ErrorKind::ConnectionFailed => {
+                (format!("NIRU Share is not running on {h}"), false)
+            }
+            ureq::ErrorKind::Io => (format!("{h} did not answer in time"), false),
+            _ => (format!("{h}: {t}"), false),
+        },
+    };
+    DeliverError { message, permanent }
+}
+
 fn deliver_http(d: &Delivery) -> Result<(), DeliverError> {
     let url = format!("http://{}:{}/share", d.peer.ip, d.peer.port);
     ureq::post(&url)
@@ -1226,10 +1281,227 @@ fn deliver_http(d: &Delivery) -> Result<(), DeliverError> {
         .timeout(Duration::from_secs(30))
         .send_bytes(d.payload)
         .map(|_| ())
-        .map_err(|e| DeliverError {
-            message: e.to_string(),
-            permanent: false,
+        .map_err(|e| describe_failure(&d.peer.host, &e))
+}
+
+// ── Contacts and status ────────────────────────────────────────────────────
+
+fn contacts_path() -> PathBuf {
+    state_dir().join("contacts.json")
+}
+static CONTACTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// Remember the last successful contact with a trusted host, per direction.
+fn record_contact(path: &Path, host: &str, direction: &str, now: u64) {
+    let _guard = CONTACTS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut all: serde_json::Map<String, serde_json::Value> = fs::read(path)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default();
+    let entry = all
+        .entry(host.to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    if let Some(obj) = entry.as_object_mut() {
+        obj.insert(direction.to_string(), now.into());
+    }
+    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+    if fs::write(&tmp, serde_json::Value::Object(all).to_string()).is_ok()
+        && private_file(&tmp).is_ok()
+    {
+        let _ = fs::rename(&tmp, path);
+    }
+}
+fn read_contacts(path: &Path) -> serde_json::Map<String, serde_json::Value> {
+    fs::read(path)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
+}
+
+/// "3 min", "2 h", "5 days": a coarse, readable span.
+fn span(secs: u64) -> String {
+    match secs {
+        0..=59 => format!("{secs} s"),
+        60..=3599 => format!("{} min", secs / 60),
+        3600..=86_399 => format!("{} h", secs / 3600),
+        _ => {
+            let d = secs / 86_400;
+            format!("{d} day{}", if d == 1 { "" } else { "s" })
+        }
+    }
+}
+fn ago(now: u64, then: u64) -> String {
+    if then == 0 {
+        "never".into()
+    } else {
+        format!("{} ago", span(now.saturating_sub(then)))
+    }
+}
+
+fn read_outgoing(out: &Path) -> Vec<Outgoing> {
+    let mut items: Vec<Outgoing> = fs::read_dir(out)
+        .map(|rd| {
+            rd.flatten()
+                .filter_map(|e| fs::read(e.path().join("meta.json")).ok())
+                .filter_map(|b| serde_json::from_slice(&b).ok())
+                .collect()
         })
+        .unwrap_or_default();
+    items.sort_by_key(|o| o.created);
+    items
+}
+
+/// The status snapshot: trusted devices with reachability and last contact,
+/// every queued item with per-recipient state, and recent finished items.
+fn status_json(
+    cfg: &Config,
+    peers: &Result<Vec<Peer>, String>,
+    outgoing: &[Outgoing],
+    history: &[serde_json::Value],
+    contacts: &serde_json::Map<String, serde_json::Value>,
+    now: u64,
+) -> serde_json::Value {
+    let devices: Vec<_> = cfg
+        .trusted
+        .iter()
+        .map(|t| {
+            let p = peers.as_ref().ok().and_then(|p| find_peer(p, &t.host));
+            let c = contacts.get(&t.host);
+            let at = |k: &str| {
+                c.and_then(|c| c.get(k))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0)
+            };
+            serde_json::json!({
+                "host": t.host,
+                "online": p.map(|p| p.online).unwrap_or(false),
+                "address": p.map(|p| p.ip.clone()).unwrap_or_default(),
+                "last_sent": at("sent"),
+                "last_received": at("received"),
+                "last_contact": at("sent").max(at("received")),
+            })
+        })
+        .collect();
+    let outgoing: Vec<_> = outgoing
+        .iter()
+        .map(|o| {
+            let created = o.created;
+            serde_json::json!({
+                "id": o.id,
+                "kind": o.kind,
+                "name": o.name,
+                "created": created,
+                "expires": if created > 0 { created + EXPIRY_SECS } else { 0 },
+                "recipients": o.recipients.iter().map(|r| serde_json::json!({
+                    "host": r.host,
+                    "state": r.status,
+                    "attempts": r.attempts,
+                    "next_retry": if is_final(&r.status) { 0 } else { r.next_attempt.max(now) },
+                    "last_error": r.last_error,
+                })).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    let recent: Vec<_> = history.iter().rev().take(10).cloned().collect();
+    serde_json::json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "tailscale": peers.is_ok(),
+        "trusted": cfg.trusted.len(),
+        "devices": devices,
+        "outgoing": outgoing,
+        "recent": recent,
+    })
+}
+
+fn status_text(v: &serde_json::Value, now: u64) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::new();
+    let str_of = |v: &serde_json::Value| v.as_str().unwrap_or_default().to_string();
+    let num = |v: &serde_json::Value| v.as_u64().unwrap_or(0);
+    let _ = writeln!(s, "NIRU Share {}", str_of(&v["version"]));
+    if v["tailscale"] == false {
+        let _ = writeln!(s, "Tailscale is not running on this device.");
+    }
+    let _ = writeln!(s, "\nDevices");
+    let devices = v["devices"].as_array().cloned().unwrap_or_default();
+    if devices.is_empty() {
+        let _ = writeln!(s, "  none paired");
+    }
+    for d in &devices {
+        let _ = writeln!(
+            s,
+            "  {:<16} {:<8} last contact {}",
+            short_host(&str_of(&d["host"])),
+            if d["online"] == true {
+                "online"
+            } else {
+                "offline"
+            },
+            ago(now, num(&d["last_contact"]))
+        );
+    }
+    let _ = writeln!(s, "\nOutgoing");
+    let outgoing = v["outgoing"].as_array().cloned().unwrap_or_default();
+    if outgoing.is_empty() {
+        let _ = writeln!(s, "  nothing queued");
+    }
+    for o in &outgoing {
+        let expires = num(&o["expires"]);
+        let _ = writeln!(
+            s,
+            "  {} ({}) · queued {} · expires in {}",
+            str_of(&o["name"]),
+            str_of(&o["kind"]),
+            ago(now, num(&o["created"])),
+            span(expires.saturating_sub(now))
+        );
+        for r in o["recipients"].as_array().into_iter().flatten() {
+            let mut line = format!(
+                "    {:<16} {:<9} {} attempt{}",
+                short_host(&str_of(&r["host"])),
+                str_of(&r["state"]),
+                num(&r["attempts"]),
+                if num(&r["attempts"]) == 1 { "" } else { "s" }
+            );
+            let next = num(&r["next_retry"]);
+            if next > now {
+                let _ = write!(line, " · next try in {}", span(next - now));
+            } else if next > 0 {
+                line.push_str(" · next try now");
+            }
+            let err = str_of(&r["last_error"]);
+            if !err.is_empty() {
+                let _ = write!(line, " · {err}");
+            }
+            let _ = writeln!(s, "{line}");
+        }
+    }
+    let recent = v["recent"].as_array().cloned().unwrap_or_default();
+    if !recent.is_empty() {
+        let _ = writeln!(s, "\nRecent");
+        for h in &recent {
+            let states: Vec<String> = h["recipients"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|r| {
+                    format!(
+                        "{} {}",
+                        short_host(&str_of(&r["host"])),
+                        str_of(&r["status"])
+                    )
+                })
+                .collect();
+            let _ = writeln!(
+                s,
+                "  {} ({}) · {} · {}",
+                str_of(&h["name"]),
+                str_of(&h["kind"]),
+                ago(now, num(&h["finished"])),
+                states.join(", ")
+            );
+        }
+    }
+    s
 }
 
 fn read_clipboard() -> Result<(String, String, Vec<u8>), String> {
@@ -1387,11 +1659,43 @@ fn revoke(host: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn status() -> Result<(), String> {
+/// `status` prints JSON when asked (--json) or when stdout is not a
+/// terminal, so scripts keep getting JSON; people get text.
+fn status(args: &[String]) -> Result<(), String> {
+    use std::io::IsTerminal;
     let cfg = load_config()?;
+    let now = now_secs();
+    let peers = tailscale().map(|(_, p)| p);
+    let v = status_json(
+        &cfg,
+        &peers,
+        &read_outgoing(&state_dir().join("out")),
+        &read_history(&history_path()),
+        &read_contacts(&contacts_path()),
+        now,
+    );
+    let json = args.iter().any(|a| a == "--json")
+        || (!args.iter().any(|a| a == "--text") && !std::io::stdout().is_terminal());
+    if json {
+        println!("{v}");
+    } else {
+        print!("{}", status_text(&v, now));
+    }
+    Ok(())
+}
+fn outbox() -> Result<(), String> {
+    let out = read_outgoing(&state_dir().join("out"));
+    let v = status_json(
+        &Config::default(),
+        &Ok(vec![]),
+        &out,
+        &[],
+        &Default::default(),
+        now_secs(),
+    );
     println!(
         "{}",
-        serde_json::json!({"trusted": cfg.trusted.len(), "devices": online_status(&cfg)})
+        serde_json::to_string_pretty(&v["outgoing"]).map_err(|e| e.to_string())?
     );
     Ok(())
 }
@@ -1517,7 +1821,7 @@ fn main() {
             Ok(())
         }
         Some("--help") | None => {
-            println!("NIRUSHARE {}\nUsage: nirushare serve|devices|trust HOST TOKEN|revoke HOST|token|send --to HOST|--all [--file PATH|--stdin]|inbox|status|copy ID|open ID|email", env!("CARGO_PKG_VERSION"));
+            println!("NIRUSHARE {}\nUsage: nirushare serve|devices|trust HOST TOKEN|revoke HOST|token|send --to HOST|--all [--file PATH|--stdin]|inbox|outbox|status [--json|--text]|copy ID|open ID|email", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
         Some("serve") => serve(),
@@ -1534,7 +1838,8 @@ fn main() {
         Some("revoke") if args.len() == 2 => revoke(&args[1]),
         Some("send") => send(&args[1..]),
         Some("inbox") => list_inbox(),
-        Some("status") => status(),
+        Some("status") => status(&args[1..]),
+        Some("outbox") => outbox(),
         Some("copy") if args.len() == 2 => copy_item(&args[1]),
         Some("open") if args.len() == 2 => open_item(&args[1]),
         Some("email") => email(),
@@ -1648,7 +1953,7 @@ mod tests {
         let mut peer_calls = 0;
         let mut peers = || {
             peer_calls += 1;
-            vec![online("othala")]
+            Ok(vec![online("othala")])
         };
         let mut sends = 0;
         let mut deliver = |_: &Delivery| -> Result<(), DeliverError> {
@@ -1660,6 +1965,7 @@ mod tests {
             now,
             peers: &mut peers,
             deliver: &mut deliver,
+            contacts: None,
         };
         process_queue(&out, &history, &mut env);
         assert!(!done.exists(), "final entry and its payload are removed");
@@ -1682,13 +1988,14 @@ mod tests {
         let waiting = queue_entry(&out, "2-wait", now, vec![recipient("void", "pending")]);
         unreadable_payload(&waiting);
         let cfg = trusted_cfg(&["void"]);
-        let mut peers = || vec![];
+        let mut peers = || Ok(vec![]);
         let mut deliver = |_: &Delivery| -> Result<(), DeliverError> { panic!("no send") };
         let mut env = QueueEnv {
             cfg: &cfg,
             now,
             peers: &mut peers,
             deliver: &mut deliver,
+            contacts: None,
         };
         process_queue(&out, &history, &mut env);
         assert_eq!(read_meta(&waiting).recipients[0].status, "waiting");
@@ -1712,7 +2019,7 @@ mod tests {
         );
         fs::write(dir.join("payload"), b"hello").unwrap();
         let cfg = trusted_cfg(&["othala", "algiz"]);
-        let mut peers = || vec![online("othala"), online("algiz")];
+        let mut peers = || Ok(vec![online("othala"), online("algiz")]);
         let mut deliver = |d: &Delivery| -> Result<(), DeliverError> {
             assert_eq!(d.payload, b"hello");
             if d.peer.host == "othala" {
@@ -1729,6 +2036,7 @@ mod tests {
             now,
             peers: &mut peers,
             deliver: &mut deliver,
+            contacts: None,
         };
         process_queue(&out, &history, &mut env);
         let meta = read_meta(&dir);
@@ -1741,7 +2049,7 @@ mod tests {
         assert!(dir.join("payload").exists());
 
         // A permanent failure makes every recipient final: archived, payload gone.
-        let mut peers = || vec![online("algiz")];
+        let mut peers = || Ok(vec![online("algiz")]);
         let mut deliver = |_: &Delivery| -> Result<(), DeliverError> {
             Err(DeliverError {
                 message: "too large for algiz".into(),
@@ -1753,6 +2061,7 @@ mod tests {
             now: now + 1000,
             peers: &mut peers,
             deliver: &mut deliver,
+            contacts: None,
         };
         process_queue(&out, &history, &mut env);
         assert!(!dir.exists());
@@ -1770,7 +2079,7 @@ mod tests {
         unreadable_payload(&old);
         let mtime = entry_mtime(&fresh).unwrap();
         let cfg = trusted_cfg(&["void"]);
-        let mut peers = || vec![];
+        let mut peers = || Ok(vec![]);
         let mut deliver = |_: &Delivery| -> Result<(), DeliverError> { panic!("no send") };
         // Shortly after: the fresh entry gets its directory time written back once.
         let mut env = QueueEnv {
@@ -1778,6 +2087,7 @@ mod tests {
             now: mtime + 60,
             peers: &mut peers,
             deliver: &mut deliver,
+            contacts: None,
         };
         process_queue(&out, &history, &mut env);
         assert_eq!(read_meta(&fresh).created, mtime);
@@ -1787,6 +2097,7 @@ mod tests {
             now: mtime + EXPIRY_SECS + 61,
             peers: &mut peers,
             deliver: &mut deliver,
+            contacts: None,
         };
         process_queue(&out, &history, &mut env);
         assert!(!fresh.exists() && !old.exists());
@@ -1817,7 +2128,7 @@ mod tests {
         let calls = std::cell::Cell::new(0);
         let mut peers = || {
             calls.set(calls.get() + 1);
-            vec![]
+            Ok(vec![])
         };
         let mut deliver = |_: &Delivery| -> Result<(), DeliverError> { panic!("offline") };
         let mut pass = |at: u64| {
@@ -1826,6 +2137,7 @@ mod tests {
                 now: at,
                 peers: &mut peers,
                 deliver: &mut deliver,
+                contacts: None,
             };
             process_queue(&out, &history, &mut env)
         };
@@ -1860,13 +2172,14 @@ mod tests {
         let out = root.join("out");
         fs::create_dir_all(&out).unwrap();
         let cfg = trusted_cfg(&[]);
-        let mut peers = || -> Vec<Peer> { panic!("no Tailscale query when idle") };
+        let mut peers = || -> Result<Vec<Peer>, String> { panic!("no Tailscale query when idle") };
         let mut deliver = |_: &Delivery| -> Result<(), DeliverError> { panic!("no send") };
         let mut env = QueueEnv {
             cfg: &cfg,
             now: 1,
             peers: &mut peers,
             deliver: &mut deliver,
+            contacts: None,
         };
         assert_eq!(process_queue(&out, &root.join("h"), &mut env), None);
     }
@@ -1941,6 +2254,91 @@ mod tests {
         assert!(!dir.join("1-a.json").exists() && !dir.join("2-b.json").exists());
         assert!(dir.join("notes.txt").exists() && root.join("stray.json").exists());
         assert_eq!(prune_dedup(&root.join("missing"), 0, 0), 0);
+    }
+
+    #[test]
+    fn status_tells_the_truth_per_recipient_and_device() {
+        let root = temp_dir("status");
+        let out = root.join("out");
+        let history = root.join("history.jsonl");
+        let contacts = root.join("contacts.json");
+        let now = 1_800_000_000;
+        let dir = queue_entry(
+            &out,
+            "8-status",
+            now,
+            vec![
+                recipient("othala.tail.ts.net", "pending"),
+                recipient("void.tail.ts.net", "pending"),
+            ],
+        );
+        fs::write(dir.join("payload"), b"hello").unwrap();
+        let cfg = trusted_cfg(&[
+            "othala.tail.ts.net",
+            "void.tail.ts.net",
+            "algiz.tail.ts.net",
+        ]);
+        let mut peers = || {
+            Ok(vec![
+                Peer {
+                    online: false,
+                    ..online("othala.tail.ts.net")
+                },
+                online("void.tail.ts.net"),
+            ])
+        };
+        let mut deliver = |d: &Delivery| -> Result<(), DeliverError> {
+            assert_eq!(d.peer.host, "void.tail.ts.net");
+            Ok(())
+        };
+        let mut env = QueueEnv {
+            cfg: &cfg,
+            now,
+            peers: &mut peers,
+            deliver: &mut deliver,
+            contacts: Some(&contacts),
+        };
+        process_queue(&out, &history, &mut env);
+        record_contact(&contacts, "algiz.tail.ts.net", "received", now - 7200);
+        let peers = Ok(vec![online("void.tail.ts.net")]);
+        let v = status_json(
+            &cfg,
+            &peers,
+            &read_outgoing(&out),
+            &read_history(&history),
+            &read_contacts(&contacts),
+            now + 2,
+        );
+        let r = &v["outgoing"][0]["recipients"];
+        assert_eq!(r[0]["state"], "waiting");
+        assert_eq!(r[0]["last_error"], "othala is offline");
+        assert_eq!(r[0]["next_retry"], now + 5);
+        assert_eq!(r[1]["state"], "delivered");
+        assert_eq!(v["devices"][1]["online"], true);
+        assert_eq!(v["devices"][1]["last_sent"], now);
+        assert_eq!(v["devices"][2]["last_contact"], now - 7200);
+        let text = status_text(&v, now + 2);
+        assert!(text.contains("othala is offline"), "{text}");
+        assert!(text.contains("next try in 3 s"), "{text}");
+        assert!(text.contains("last contact 2 h ago"), "{text}");
+        assert!(text.contains("last contact never"), "{text}");
+    }
+
+    #[test]
+    fn failures_are_described_in_plain_words() {
+        let status = |code| {
+            let e = ureq::Error::Status(code, ureq::Response::new(code, "x", "").unwrap());
+            let d = describe_failure("othala.tail.ts.net", &e);
+            (d.message, d.permanent)
+        };
+        assert_eq!(status(401), ("not trusted on othala".to_string(), false));
+        assert_eq!(status(413), ("too large for othala".to_string(), true));
+        assert!(!status(500).1 && !status(503).1);
+        let refused = ureq::get("http://127.0.0.1:9/").call().unwrap_err();
+        assert_eq!(
+            describe_failure("othala", &refused).message,
+            "NIRU Share is not running on othala"
+        );
     }
 
     #[test]

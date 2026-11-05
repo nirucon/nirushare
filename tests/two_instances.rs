@@ -181,6 +181,15 @@ fn two_local_instances_exchange_text_and_images() {
     });
     std::thread::sleep(Duration::from_millis(500));
     assert_eq!(alpha.queue_len(), 1, "still queued while beta is offline");
+    let status: serde_json::Value =
+        serde_json::from_str(&alpha.run(&["status", "--json"], None)).unwrap();
+    let r = &status["outgoing"][0]["recipients"][0];
+    assert_eq!(r["state"], "waiting");
+    assert_eq!(r["last_error"], "NIRU Share is not running on beta");
+    assert!(r["next_retry"].as_u64().unwrap() > 0);
+    assert!(alpha
+        .run(&["status", "--text"], None)
+        .contains("NIRU Share is not running on beta"));
     beta.start();
     let took = wait_for(Duration::from_secs(15), || alpha.queue_len() == 0);
     assert!(
@@ -189,6 +198,11 @@ fn two_local_instances_exchange_text_and_images() {
     );
     assert_eq!(texts(&beta.inbox()), ["hej från alpha ✓"]);
     assert!(alpha.history().contains("\"delivered\""));
+    let status: serde_json::Value =
+        serde_json::from_str(&alpha.run(&["status", "--json"], None)).unwrap();
+    assert!(status["outgoing"].as_array().unwrap().is_empty());
+    assert!(status["devices"][0]["last_sent"].as_u64().unwrap() > 0);
+    assert_eq!(status["recent"][0]["recipients"][0]["status"], "delivered");
 
     // An image the other way, sent while both run: the wake socket starts
     // the pass at once instead of a timer.
