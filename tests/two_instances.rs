@@ -216,6 +216,25 @@ fn two_local_instances_exchange_text_and_images() {
         alpha.inbox().iter().any(|i| i["kind"] == "image")
     });
     assert!(took < Duration::from_secs(3), "wake took {took:?}");
+    // A sender CLI without XDG_RUNTIME_DIR still wakes the service.
+    let mut c = alpha.cmd();
+    c.env_remove("XDG_RUNTIME_DIR")
+        .args(["send", "--to", "beta", "--stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null());
+    let mut child = c.spawn().unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"no runtime dir")
+        .unwrap();
+    assert!(child.wait().unwrap().success());
+    let took = wait_for(Duration::from_secs(5), || {
+        texts(&beta.inbox()).contains(&"no runtime dir".to_string())
+    });
+    assert!(took < Duration::from_secs(3), "pointer wake took {took:?}");
+
     let item = alpha
         .inbox()
         .into_iter()

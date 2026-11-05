@@ -972,6 +972,13 @@ fn bind_wake() -> Result<UnixDatagram, String> {
     }
     let sock = UnixDatagram::bind(&path).map_err(|e| format!("{}: {e}", path.display()))?;
     private_file(&path)?;
+    // A CLI started with a different XDG_RUNTIME_DIR (or none) still finds
+    // the socket through this pointer in the private state directory.
+    let pointer = state_dir().join("wake-socket");
+    let tmp = pointer.with_extension(format!("tmp{}", std::process::id()));
+    if fs::write(&tmp, path.as_os_str().as_encoded_bytes()).is_ok() && private_file(&tmp).is_ok() {
+        let _ = fs::rename(&tmp, &pointer);
+    }
     Ok(sock)
 }
 /// Block until a wake datagram arrives or `wait` passes (None: no timeout).
@@ -988,8 +995,14 @@ fn wait_for_wake(sock: &UnixDatagram, wait: Option<Duration>) {
 }
 /// Tell a running service that the queue changed. Missing service: no-op.
 fn wake_service() {
-    if let Ok(sock) = UnixDatagram::unbound() {
-        let _ = sock.send_to(b"q", wake_path());
+    let Ok(sock) = UnixDatagram::unbound() else {
+        return;
+    };
+    if sock.send_to(b"q", wake_path()).is_ok() {
+        return;
+    }
+    if let Ok(path) = fs::read_to_string(state_dir().join("wake-socket")) {
+        let _ = sock.send_to(b"q", path.trim_end());
     }
 }
 
