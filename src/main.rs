@@ -880,9 +880,15 @@ fn serve() -> Result<(), String> {
 
 /// The queue worker sleeps until the next retry or expiry is due, or until
 /// `nirushare send` wakes it through the wake socket. With nothing pending
-/// it blocks indefinitely: no timer, no Tailscale query, no spawn.
+/// it blocks until the daily dedup pruning: no Tailscale query, no spawn.
 fn queue_worker(wake: Option<UnixDatagram>) {
+    let mut next_prune = 0;
     loop {
+        let now = now_secs();
+        if now >= next_prune {
+            prune_dedup(&data_dir().join("dedup"), now, DEDUP_KEEP_SECS);
+            next_prune = now + 24 * 60 * 60;
+        }
         let mut deadline = None;
         if let Ok(cfg) = load_config() {
             let mut peers = || tailscale().map(|(_, p)| p).unwrap_or_default();
@@ -895,15 +901,52 @@ fn queue_worker(wake: Option<UnixDatagram>) {
             };
             deadline = process_queue(&state_dir().join("out"), &history_path(), &mut env);
         }
-        let wait = deadline.map(|d| Duration::from_secs(d.saturating_sub(now_secs()).max(1)));
+        let deadline = deadline.map_or(next_prune, |d| d.min(next_prune));
+        let wait = Duration::from_secs(deadline.saturating_sub(now_secs()).max(1));
         match &wake {
-            Some(sock) => wait_for_wake(sock, wait),
+            Some(sock) => wait_for_wake(sock, Some(wait)),
             // Without a wake socket new items are only noticed by a slow timer.
-            None => thread::sleep(wait.unwrap_or(WAKELESS_IDLE).min(WAKELESS_IDLE)),
+            None => thread::sleep(wait.min(WAKELESS_IDLE)),
         }
     }
 }
 const WAKELESS_IDLE: Duration = Duration::from_secs(60);
+
+/// Dedup receipts must outlive every retry of a transfer (7-day expiry);
+/// they are kept for 30 days and pruned at start and once a day.
+const DEDUP_KEEP_SECS: u64 = 30 * 24 * 60 * 60;
+fn prune_dedup(dir: &Path, now: u64, keep: u64) -> usize {
+    let mut removed = 0;
+    let Ok(senders) = fs::read_dir(dir) else {
+        return 0;
+    };
+    for sender in senders.flatten() {
+        let Ok(kind) = sender.file_type() else {
+            continue;
+        };
+        if !kind.is_dir() {
+            continue;
+        }
+        let Ok(receipts) = fs::read_dir(sender.path()) else {
+            continue;
+        };
+        for receipt in receipts.flatten() {
+            let path = receipt.path();
+            let is_receipt = receipt.file_type().map(|t| t.is_file()).unwrap_or(false)
+                && path.extension().is_some_and(|e| e == "json");
+            if !is_receipt {
+                continue;
+            }
+            let Some(mtime) = entry_mtime(&path) else {
+                continue;
+            };
+            if now.saturating_sub(mtime) > keep && fs::remove_file(&path).is_ok() {
+                removed += 1;
+            }
+        }
+    }
+    removed
+}
 
 fn runtime_dir() -> PathBuf {
     match std::env::var_os("XDG_RUNTIME_DIR") {
@@ -1874,6 +1917,30 @@ mod tests {
             None,
             "an empty token never matches"
         );
+    }
+
+    #[test]
+    fn dedup_receipts_older_than_30_days_are_pruned() {
+        let root = temp_dir("dedup");
+        let dir = root.join("othala_ts_net");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("1-a.json"), "{}").unwrap();
+        fs::write(dir.join("2-b.json"), "{}").unwrap();
+        fs::write(dir.join("notes.txt"), "keep").unwrap();
+        fs::write(root.join("stray.json"), "{}").unwrap();
+        let mtime = entry_mtime(&dir.join("1-a.json")).unwrap();
+        assert_eq!(
+            prune_dedup(&root, mtime + DEDUP_KEEP_SECS - 10, DEDUP_KEEP_SECS),
+            0
+        );
+        assert!(dir.join("1-a.json").exists());
+        assert_eq!(
+            prune_dedup(&root, mtime + DEDUP_KEEP_SECS + 10, DEDUP_KEEP_SECS),
+            2
+        );
+        assert!(!dir.join("1-a.json").exists() && !dir.join("2-b.json").exists());
+        assert!(dir.join("notes.txt").exists() && root.join("stray.json").exists());
+        assert_eq!(prune_dedup(&root.join("missing"), 0, 0), 0);
     }
 
     #[test]
