@@ -328,11 +328,30 @@ fn online_status(cfg: &Config) -> Vec<serde_json::Value> {
     }).collect()
 }
 
-fn credentials(cfg: &Config, token: &str) -> Option<String> {
-    cfg.trusted
+/// Compare two secrets without leaking where they differ or how long they
+/// are: both are hashed to fixed-length SHA-256 digests, which are compared
+/// with no early exit.
+fn secrets_equal(a: &str, b: &str) -> bool {
+    let (da, db) = (Sha256::digest(a.as_bytes()), Sha256::digest(b.as_bytes()));
+    let diff = da
         .iter()
-        .find(|t| t.token == token)
-        .map(|t| t.host.clone())
+        .zip(db.iter())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y));
+    std::hint::black_box(diff) == 0
+}
+/// The trusted host whose token matches. Every record is compared, so the
+/// time taken does not reveal which one (if any) matched.
+fn credentials(cfg: &Config, token: &str) -> Option<String> {
+    if token.is_empty() {
+        return None;
+    }
+    let mut found = None;
+    for t in &cfg.trusted {
+        if secrets_equal(&t.token, token) && found.is_none() {
+            found = Some(t.host.clone());
+        }
+    }
+    found
 }
 fn incoming_notice(item: &InboxItem) {
     let item = item.clone();
@@ -1500,6 +1519,37 @@ mod tests {
         let start = std::time::Instant::now();
         wait_for_wake(&sock, Some(Duration::from_millis(200)));
         assert!(start.elapsed() >= Duration::from_millis(150));
+    }
+
+    #[test]
+    fn token_compare_is_exact_and_checks_every_record() {
+        assert!(secrets_equal("abc", "abc"));
+        assert!(!secrets_equal("abc", "abd"));
+        assert!(!secrets_equal("abc", "abcd"));
+        assert!(!secrets_equal("", "a"));
+        let long = "f".repeat(48);
+        assert!(!secrets_equal(&long, &long[..47]));
+        let mut cfg = trusted_cfg(&["othala", "void"]);
+        cfg.trusted[1].token = "cd".repeat(24);
+        assert_eq!(
+            credentials(&cfg, &"ab".repeat(24)).as_deref(),
+            Some("othala")
+        );
+        assert_eq!(credentials(&cfg, &"cd".repeat(24)).as_deref(), Some("void"));
+        assert_eq!(credentials(&cfg, &"cd".repeat(23)), None);
+        assert_eq!(credentials(&cfg, ""), None);
+        let empty = Config {
+            version: 1,
+            trusted: vec![Trusted {
+                host: "x".into(),
+                token: String::new(),
+            }],
+        };
+        assert_eq!(
+            credentials(&empty, ""),
+            None,
+            "an empty token never matches"
+        );
     }
 
     #[test]
