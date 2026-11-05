@@ -286,5 +286,21 @@ fn two_local_instances_exchange_text_and_images() {
         .unwrap();
     assert_eq!(health, "{\"ok\":true,\"protocol\":1}");
     assert!(!Path::new(&beta.root).join("nirushare").exists());
+
+    // Inbox housekeeping: a preview first, removal only with --yes.
+    std::thread::sleep(Duration::from_millis(1100));
+    let before = alpha.inbox().len();
+    let preview = alpha.run(&["inbox", "--older-than", "0d"], None);
+    assert!(
+        preview.contains("Would remove 1 inbox item") && preview.contains("and the file"),
+        "{preview}"
+    );
+    assert!(path.exists() && alpha.inbox().len() == before);
+    let done = alpha.run(&["inbox", "--older-than", "0d", "--yes"], None);
+    assert!(done.contains("Removed 1."), "{done}");
+    assert!(!path.exists() && alpha.inbox().is_empty());
+    assert!(alpha
+        .run(&["inbox", "--clear-read"], None)
+        .contains("Nothing to remove"));
     assert!(!Path::new(&beta.root).join("Downloads/nirushare").exists());
 }

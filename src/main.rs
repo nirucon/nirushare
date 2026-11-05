@@ -1708,24 +1708,180 @@ fn list_devices() -> Result<(), String> {
     );
     Ok(())
 }
-fn list_inbox() -> Result<(), String> {
-    ensure_dirs()?;
+fn load_inbox(dir: &Path) -> Vec<InboxItem> {
     let mut items = Vec::new();
-    if let Ok(rd) = fs::read_dir(data_dir().join("inbox")) {
+    if let Ok(rd) = fs::read_dir(dir) {
         for e in rd.flatten() {
-            if let Ok(bytes) = fs::read(e.path()) {
-                if let Ok(item) = serde_json::from_slice::<InboxItem>(&bytes) {
-                    items.push(item);
+            if e.path().extension().is_some_and(|x| x == "json") {
+                if let Ok(bytes) = fs::read(e.path()) {
+                    if let Ok(item) = serde_json::from_slice::<InboxItem>(&bytes) {
+                        items.push(item);
+                    }
                 }
             }
         }
     }
     items.sort_by_key(|i| i.received);
+    items
+}
+fn list_inbox() -> Result<(), String> {
+    ensure_dirs()?;
+    let items = load_inbox(&data_dir().join("inbox"));
     println!(
         "{}",
         serde_json::to_string_pretty(&items).map_err(|e| e.to_string())?
     );
     Ok(())
+}
+
+/// "30d", "12h", "2w" or a plain number of days, in seconds.
+fn parse_age(text: &str) -> Option<u64> {
+    let (num, unit) = match text.char_indices().find(|(_, c)| !c.is_ascii_digit()) {
+        Some((i, _)) => (&text[..i], &text[i..]),
+        None => (text, "d"),
+    };
+    let n: u64 = num.parse().ok()?;
+    let unit = match unit {
+        "h" => 3600,
+        "d" => 86_400,
+        "w" => 7 * 86_400,
+        _ => return None,
+    };
+    n.checked_mul(unit)
+}
+/// The received file an inbox item owns, if it is a regular file inside
+/// the NIRUSHARE folder of Downloads. Anything else is never deleted.
+fn owned_file(item: &InboxItem, received_dir: &Path) -> Option<PathBuf> {
+    if item.path.is_empty() {
+        return None;
+    }
+    let path = PathBuf::from(&item.path);
+    let meta = fs::symlink_metadata(&path).ok()?;
+    if !meta.file_type().is_file() {
+        return None;
+    }
+    let parent = path.parent()?.canonicalize().ok()?;
+    (parent == received_dir.canonicalize().ok()?).then_some(path)
+}
+fn select_inbox(
+    items: &[InboxItem],
+    read_only: bool,
+    older: Option<u64>,
+    now: u64,
+) -> Vec<&InboxItem> {
+    items
+        .iter()
+        .filter(|i| !read_only || i.read)
+        .filter(|i| older.is_none_or(|age| now.saturating_sub(i.received) > age))
+        .collect()
+}
+/// Remove one inbox item and the received file it owns. The dedup receipt
+/// stays, so a late retry of the same transfer is not stored again.
+fn remove_inbox_item(inbox: &Path, item: &InboxItem, received_dir: &Path) -> Result<(), String> {
+    if !valid_id(&item.id) {
+        return Err("invalid item id".into());
+    }
+    if let Some(file) = owned_file(item, received_dir) {
+        fs::remove_file(&file).map_err(|e| format!("{}: {e}", file.display()))?;
+    }
+    let meta = inbox.join(format!("{}.json", item.id));
+    fs::remove_file(&meta).map_err(|e| format!("{}: {e}", meta.display()))
+}
+/// `inbox --clear-read` / `--older-than AGE`: preview what would go, and
+/// remove it only with `--yes`.
+fn inbox_cleanup(args: &[String]) -> Result<(), String> {
+    let (mut read_only, mut older, mut yes) = (false, None, false);
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--clear-read" => read_only = true,
+            "--yes" => yes = true,
+            "--older-than" if i + 1 < args.len() => {
+                older =
+                    Some(parse_age(&args[i + 1]).ok_or("--older-than takes e.g. 30d, 12h or 2w")?);
+                i += 1;
+            }
+            "--json" => {}
+            other => return Err(format!("unknown inbox option: {other}")),
+        }
+        i += 1;
+    }
+    if !read_only && older.is_none() {
+        return list_inbox();
+    }
+    ensure_dirs()?;
+    let inbox = data_dir().join("inbox");
+    let received_dir = downloads_dir().join("nirushare");
+    let items = load_inbox(&inbox);
+    let now = now_secs();
+    let chosen = select_inbox(&items, read_only, older, now);
+    if chosen.is_empty() {
+        println!("Nothing to remove.");
+        return Ok(());
+    }
+    println!(
+        "{} {} inbox item{}:",
+        if yes { "Removing" } else { "Would remove" },
+        chosen.len(),
+        if chosen.len() == 1 { "" } else { "s" }
+    );
+    for item in &chosen {
+        let what = if item.kind == "text" {
+            format!("text, {} characters", item.text.chars().count())
+        } else {
+            item.name.clone()
+        };
+        let mut line = format!(
+            "  {} from {} · received {}{}",
+            what,
+            short_host(&item.sender),
+            ago(now, item.received),
+            if item.read { " · read" } else { " · unread" }
+        );
+        if item.kind == "image" {
+            match owned_file(item, &received_dir) {
+                Some(file) => line.push_str(&format!("\n      and the file {}", file.display())),
+                None if !item.path.is_empty() => {
+                    line.push_str(" (its file is kept: not in Downloads/nirushare)")
+                }
+                None => {}
+            }
+        }
+        println!("{line}");
+    }
+    if !yes {
+        println!("Nothing was removed. Run the same command with --yes to remove these.");
+        return Ok(());
+    }
+    let mut failed = 0;
+    for item in &chosen {
+        if let Err(e) = remove_inbox_item(&inbox, item, &received_dir) {
+            eprintln!("nirushare: {e}");
+            failed += 1;
+        }
+    }
+    if failed > 0 {
+        return Err(format!("{failed} item(s) could not be removed"));
+    }
+    println!("Removed {}.", chosen.len());
+    Ok(())
+}
+/// Copy and Open mark an item read, so `inbox --clear-read` can find it.
+fn mark_read(id: &str) {
+    let Ok(mut item) = read_item(id) else {
+        return;
+    };
+    if item.read {
+        return;
+    }
+    item.read = true;
+    let meta = data_dir().join("inbox").join(format!("{id}.json"));
+    let tmp = meta.with_extension("part");
+    if let Ok(data) = serde_json::to_vec_pretty(&item) {
+        if fs::write(&tmp, data).is_ok() && private_file(&tmp).is_ok() {
+            let _ = fs::rename(&tmp, &meta);
+        }
+    }
 }
 fn copy_item(id: &str) -> Result<(), String> {
     let item = read_item(id)?;
@@ -1754,6 +1910,7 @@ fn copy_item(id: &str) -> Result<(), String> {
             ])
             .status();
     }
+    mark_read(id);
     Ok(())
 }
 fn read_item(id: &str) -> Result<InboxItem, String> {
@@ -1773,6 +1930,7 @@ fn open_item(id: &str) -> Result<(), String> {
         .arg(item.path)
         .status()
         .map_err(|e| e.to_string())?;
+    mark_read(id);
     Ok(())
 }
 fn email() -> Result<(), String> {
@@ -1821,7 +1979,7 @@ fn main() {
             Ok(())
         }
         Some("--help") | None => {
-            println!("NIRUSHARE {}\nUsage: nirushare serve|devices|trust HOST TOKEN|revoke HOST|token|send --to HOST|--all [--file PATH|--stdin]|inbox|outbox|status [--json|--text]|copy ID|open ID|email", env!("CARGO_PKG_VERSION"));
+            println!("NIRUSHARE {}\nUsage: nirushare serve|devices|trust HOST TOKEN|revoke HOST|token|send --to HOST|--all [--file PATH|--stdin]|inbox [--clear-read] [--older-than 30d] [--yes]|outbox|status [--json|--text]|copy ID|open ID|email", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
         Some("serve") => serve(),
@@ -1837,7 +1995,7 @@ fn main() {
         Some("trust") if args.len() == 3 => trust(&args[1], &args[2]),
         Some("revoke") if args.len() == 2 => revoke(&args[1]),
         Some("send") => send(&args[1..]),
-        Some("inbox") => list_inbox(),
+        Some("inbox") => inbox_cleanup(&args[1..]),
         Some("status") => status(&args[1..]),
         Some("outbox") => outbox(),
         Some("copy") if args.len() == 2 => copy_item(&args[1]),
@@ -2339,6 +2497,75 @@ mod tests {
             describe_failure("othala", &refused).message,
             "NIRU Share is not running on othala"
         );
+    }
+
+    #[test]
+    fn inbox_cleanup_selects_previews_and_keeps_foreign_files() {
+        assert_eq!(parse_age("30d"), Some(30 * 86_400));
+        assert_eq!(parse_age("12h"), Some(12 * 3600));
+        assert_eq!(parse_age("2w"), Some(14 * 86_400));
+        assert_eq!(parse_age("7"), Some(7 * 86_400));
+        for bad in ["", "d", "3m", "-1d", "1.5d"] {
+            assert_eq!(parse_age(bad), None, "{bad}");
+        }
+        let root = temp_dir("inbox");
+        let inbox = root.join("inbox");
+        let received = root.join("Downloads/nirushare");
+        fs::create_dir_all(&inbox).unwrap();
+        fs::create_dir_all(&received).unwrap();
+        let now = 1_800_000_000;
+        let item = |id: &str, kind: &str, age: u64, read: bool, path: &Path| InboxItem {
+            id: id.into(),
+            kind: kind.into(),
+            name: "x.png".into(),
+            sender: "othala".into(),
+            received: now - age,
+            path: path.display().to_string(),
+            text: String::new(),
+            read,
+        };
+        let mine = received.join("1-a.png");
+        fs::write(&mine, b"png").unwrap();
+        let foreign = root.join("elsewhere.png");
+        fs::write(&foreign, b"png").unwrap();
+        let link = received.join("link.png");
+        std::os::unix::fs::symlink(&foreign, &link).unwrap();
+        let items = vec![
+            item("1-a", "image", 40 * 86_400, true, &mine),
+            item("2-b", "image", 40 * 86_400, true, &foreign),
+            item("3-c", "image", 40 * 86_400, false, &link),
+            item("4-d", "text", 86_400, true, Path::new("")),
+        ];
+        for i in &items {
+            fs::write(
+                inbox.join(format!("{}.json", i.id)),
+                serde_json::to_vec(i).unwrap(),
+            )
+            .unwrap();
+        }
+        let ids = |v: Vec<&InboxItem>| v.iter().map(|i| i.id.clone()).collect::<Vec<_>>();
+        assert_eq!(
+            ids(select_inbox(&items, true, None, now)),
+            ["1-a", "2-b", "4-d"]
+        );
+        assert_eq!(
+            ids(select_inbox(&items, false, Some(30 * 86_400), now)),
+            ["1-a", "2-b", "3-c"]
+        );
+        assert_eq!(
+            ids(select_inbox(&items, true, Some(30 * 86_400), now)),
+            ["1-a", "2-b"]
+        );
+        assert_eq!(owned_file(&items[0], &received), Some(mine.clone()));
+        assert_eq!(owned_file(&items[1], &received), None, "outside the folder");
+        assert_eq!(owned_file(&items[2], &received), None, "a symlink");
+        for i in &items[..3] {
+            remove_inbox_item(&inbox, i, &received).unwrap();
+        }
+        assert!(!mine.exists(), "the owned received file is removed");
+        assert!(foreign.exists() && fs::symlink_metadata(&link).is_ok());
+        let left: Vec<_> = load_inbox(&inbox).into_iter().map(|i| i.id).collect();
+        assert_eq!(left, ["4-d"]);
     }
 
     #[test]
