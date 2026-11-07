@@ -325,3 +325,23 @@ assigned Debian/Arch/Void hosts. Update NIRUX and affected component READMEs/hel
 publish/verify immutable compatible assets, activate the exact versions and clean
 older-than-two-functional-generations release material with dependency closure.
 Do not turn absent hardware or an untested mode into a successful final report.
+
+## Addendum (0.4.0): Discord webhooks
+
+Discord webhooks are an explicit, opt-in outbound destination, not a device
+transport. The device protocol, pairing and trust rules above are unchanged.
+
+- None exist by default. They are configured by the user in
+  `~/.config/nirushare/webhooks.toml`, which must be a private (0600) regular
+  file owned by the user. Only `https://discord.com/api/webhooks/...` URLs (and
+  the discordapp.com, canary and ptb hosts) are accepted.
+- The URL is a credential: never printed, logged, queued, passed in argv or
+  included in errors. Queue entries, previews and undo records store the
+  webhook's name.
+- Nothing is sent without a preview that names the target. The content is
+  staged at preview time so the confirmed content is exactly the previewed one.
+- Messages are posted with `?wait=true`; the returned ids allow Undo (DELETE)
+  for 5 minutes. Mentions are never parsed (`allowed_mentions.parse = []`).
+- Delivery uses the durable outbox. HTTP 429 honours `Retry-After`; 5xx and
+  network errors back off; other 4xx are permanent failures.
+

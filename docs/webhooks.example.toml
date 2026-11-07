@@ -1,0 +1,24 @@
+# NIRUSHARE Discord webhooks: ~/.config/nirushare/webhooks.toml
+#
+# There are no webhooks until you add them here. Keep this file private:
+#     chmod 600 ~/.config/nirushare/webhooks.toml
+# A webhook URL works like a password: anyone who has it can post to the
+# channel. NIRUSHARE never prints, logs or queues the URL; everything else
+# refers to a webhook by its name (send --to discord:NAME).
+#
+# Create a webhook in Discord: Server Settings -> Integrations -> Webhooks ->
+# New Webhook -> Copy Webhook URL.
+#
+# The URLs below are placeholders and do not work.
+
+[webhook.friends]
+url = "https://discord.com/api/webhooks/000000000000000000/replace-with-the-token-from-discord"
+
+[webhook.work-log]
+url = "https://discord.com/api/webhooks/000000000000000000/replace-with-the-token-from-discord"
+username = "Niru"                            # optional: the name shown on the message
+avatar_url = "https://example.com/avatar.png"  # optional: the picture shown on the message
+embeds = false                               # optional: no link previews (default true)
+max_file_mb = 10                             # optional: the server's upload limit (default 10)
+
+# A forum or thread: add ?thread_id=<id> to the URL.

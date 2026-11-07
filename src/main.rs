@@ -10,6 +10,8 @@ use std::process::Command;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+mod discord;
+
 const PORT: u16 = 47831;
 const MAX_BYTES: usize = 25 * 1024 * 1024;
 const MAX_TEXT_BYTES: usize = 1024 * 1024;
@@ -49,6 +51,10 @@ struct Recipient {
     /// Consecutive unsuccessful passes (offline or failed), for backoff.
     #[serde(default)]
     backoff: u32,
+    /// Discord: ids of the messages already posted, so a retry continues
+    /// with the next part and Undo can delete them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    message_ids: Vec<String>,
 }
 #[derive(Serialize, Deserialize, Clone)]
 struct InboxItem {
@@ -895,6 +901,8 @@ fn queue_worker(wake: Option<UnixDatagram>) {
             let mut peers = || tailscale().map(|(_, p)| p);
             let mut deliver = deliver_http;
             let contacts = contacts_path();
+            let hooks = discord::load_webhooks();
+            let mut poster = discord::Http;
             let mut env = QueueEnv {
                 cfg: &cfg,
                 now: now_secs(),
@@ -902,6 +910,8 @@ fn queue_worker(wake: Option<UnixDatagram>) {
                 deliver: &mut deliver,
                 contacts: Some(&contacts),
                 notify: notifications_enabled(),
+                hooks: &hooks,
+                poster: &mut poster,
             };
             deadline = process_queue(&state_dir().join("out"), &history_path(), &mut env);
         }
@@ -1116,6 +1126,44 @@ struct QueueEnv<'a> {
     contacts: Option<&'a Path>,
     /// Show progress notifications for large items (off in unit tests).
     notify: bool,
+    /// Discord webhooks (read once per pass) and what posts to them.
+    hooks: &'a Result<Vec<discord::Webhook>, String>,
+    poster: &'a mut dyn discord::Poster,
+}
+
+/// An entry being worked on by one process. The service and a CLI that
+/// sends at once must never post the same Discord message twice. A claim
+/// older than CLAIM_STALE_SECS belongs to a process that died.
+const CLAIM_STALE_SECS: u64 = 10 * 60;
+struct Claim(PathBuf);
+impl Drop for Claim {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+fn claim(dir: &Path, now: u64) -> Option<Claim> {
+    let path = dir.join(".claim");
+    for _ in 0..2 {
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut f) => {
+                let _ = write!(f, "{}", std::process::id());
+                return Some(Claim(path));
+            }
+            Err(_) => {
+                let stale =
+                    entry_mtime(&path).is_some_and(|m| now.saturating_sub(m) > CLAIM_STALE_SECS);
+                if !stale {
+                    return None;
+                }
+                let _ = fs::remove_file(&path);
+            }
+        }
+    }
+    None
 }
 
 /// One pass over the outgoing queue. Final entries are archived without
@@ -1124,6 +1172,15 @@ struct QueueEnv<'a> {
 /// Returns the Unix time of the next due retry or expiry, or None when no
 /// recipient is pending.
 fn process_queue(out: &Path, history: &Path, env: &mut QueueEnv) -> Option<u64> {
+    process_queue_filtered(out, history, env, None)
+}
+/// `only`: process just this entry (a CLI that sends at once).
+fn process_queue_filtered(
+    out: &Path,
+    history: &Path,
+    env: &mut QueueEnv,
+    only: Option<&str>,
+) -> Option<u64> {
     let Ok(entries) = fs::read_dir(out) else {
         return None;
     };
@@ -1135,6 +1192,14 @@ fn process_queue(out: &Path, history: &Path, env: &mut QueueEnv) -> Option<u64> 
         if !path.is_dir() || !name.to_str().map(valid_id).unwrap_or(false) {
             continue;
         }
+        if only.is_some_and(|id| name.to_str() != Some(id)) {
+            continue;
+        }
+        let Some(_claim) = claim(&path, env.now) else {
+            // Another process is sending this entry right now; look again soon.
+            deadline = Some(deadline.map_or(env.now + 5, |d: u64| d.min(env.now + 5)));
+            continue;
+        };
         let Ok(meta_bytes) = fs::read(path.join("meta.json")) else {
             continue;
         };
@@ -1172,6 +1237,41 @@ fn process_queue(out: &Path, history: &Path, env: &mut QueueEnv) -> Option<u64> 
                 continue;
             }
             let host = outgoing.recipients[i].host.clone();
+            if host.starts_with("discord:") {
+                if payload.is_none() {
+                    match fs::read(path.join("payload")) {
+                        Ok(bytes) => payload = Some(bytes),
+                        Err(_) => {
+                            let r = &mut outgoing.recipients[i];
+                            r.status = "failed".into();
+                            r.last_error = "the queued content is missing".into();
+                            changed = true;
+                            continue;
+                        }
+                    }
+                }
+                let job = discord::Job {
+                    id: &outgoing.id,
+                    kind: &outgoing.kind,
+                    name: &outgoing.name,
+                    payload: payload.as_deref().unwrap_or_default(),
+                    now: env.now,
+                };
+                let r = &mut outgoing.recipients[i];
+                let done = discord::deliver(&job, r, env.hooks, &mut *env.poster);
+                if env.notify {
+                    let webhook = host.trim_start_matches("discord:");
+                    if done {
+                        discord::spawn_undo_notice(&outgoing.id);
+                    } else if r.status == "failed" {
+                        discord::failure_notice(&outgoing.name, webhook, &r.last_error, false);
+                    } else if r.attempts == 1 {
+                        discord::failure_notice(&outgoing.name, webhook, &r.last_error, true);
+                    }
+                }
+                changed = true;
+                continue;
+            }
             let Some(trusted) = env.cfg.trusted.iter().find(|t| t.host == host) else {
                 let r = &mut outgoing.recipients[i];
                 r.status = "rejected".into();
@@ -1707,6 +1807,19 @@ fn status_text(v: &serde_json::Value, now: u64) -> String {
             let _ = writeln!(s, "{line}");
         }
     }
+    if let Some(hooks) = v["discord"].as_array().filter(|h| !h.is_empty()) {
+        let _ = writeln!(s, "\nDiscord webhooks");
+        for h in hooks {
+            let _ = writeln!(
+                s,
+                "  discord:{:<16} {}",
+                str_of(&h["name"]),
+                str_of(&h["host"])
+            );
+        }
+    } else if let Some(e) = v["discord"]["error"].as_str() {
+        let _ = writeln!(s, "\nDiscord webhooks\n  {e}");
+    }
     let recent = v["recent"].as_array().cloned().unwrap_or_default();
     if !recent.is_empty() {
         let _ = writeln!(s, "\nRecent");
@@ -1754,17 +1867,236 @@ fn read_clipboard() -> Result<(String, String, Vec<u8>), String> {
     }
     Ok(("text".into(), "clipboard.txt".into(), out.stdout))
 }
+fn new_recipient(host: String) -> Recipient {
+    Recipient {
+        host,
+        token: String::new(),
+        status: "pending".into(),
+        attempts: 0,
+        last_error: String::new(),
+        next_attempt: 0,
+        backoff: 0,
+        message_ids: Vec::new(),
+    }
+}
+
+/// Where the content of a send comes from.
+enum Source {
+    Clipboard,
+    Stdin,
+    File(PathBuf),
+}
+
+fn read_stdin_text() -> Result<Vec<u8>, String> {
+    let mut text = Vec::new();
+    std::io::stdin()
+        .take(MAX_TEXT_BYTES as u64 + 1)
+        .read_to_end(&mut text)
+        .map_err(|e| format!("stdin: {e}"))?;
+    if text.len() > MAX_TEXT_BYTES {
+        return Err("text too large".into());
+    }
+    if text.is_empty() {
+        return Err("no text on stdin".into());
+    }
+    Ok(text)
+}
+
+/// Content for Discord: any file, text (a single URL is a link), or the
+/// clipboard (image or text).
+fn discord_content(source: &Source) -> Result<(String, String, Vec<u8>), String> {
+    let text_kind = |bytes: &[u8]| {
+        if discord::is_link(&String::from_utf8_lossy(bytes)) {
+            "link"
+        } else {
+            "text"
+        }
+    };
+    match source {
+        Source::File(path) => {
+            let meta = fs::metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
+            if !meta.is_file() {
+                return Err(format!("{} is not a file", path.display()));
+            }
+            if meta.len() > MAX_BYTES as u64 {
+                return Err("file too large (25 MB at most)".into());
+            }
+            let bytes = fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+            let name =
+                discord::safe_filename(path.file_name().and_then(|n| n.to_str()).unwrap_or("file"));
+            let kind = if image_extension(&bytes).is_some() {
+                "image"
+            } else {
+                "file"
+            };
+            Ok((kind.into(), name, bytes))
+        }
+        Source::Stdin => {
+            let text = read_stdin_text()?;
+            Ok((text_kind(&text).into(), "text.txt".into(), text))
+        }
+        Source::Clipboard => {
+            let (kind, name, bytes) = read_clipboard()?;
+            if kind == "text" {
+                if bytes.len() > MAX_TEXT_BYTES {
+                    return Err("text too large".into());
+                }
+                Ok((text_kind(&bytes).into(), name, bytes))
+            } else {
+                Ok((kind, name, bytes))
+            }
+        }
+    }
+}
+
+/// Ask on the terminal. Without a terminal there is nobody to ask.
+fn confirm_on_tty(question: &str) -> Result<bool, String> {
+    let mut tty = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+        .map_err(|_| {
+            "no terminal to confirm on; add --yes after checking the preview".to_string()
+        })?;
+    write!(tty, "{question} [y/N] ").map_err(|e| e.to_string())?;
+    tty.flush().map_err(|e| e.to_string())?;
+    let mut line = String::new();
+    let mut byte = [0u8; 1];
+    while tty.read(&mut byte).map_err(|e| e.to_string())? == 1 && byte[0] != b'\n' {
+        line.push(byte[0] as char);
+    }
+    Ok(matches!(line.trim(), "y" | "Y" | "yes" | "Yes"))
+}
+
+/// Move a confirmed preview into the queue and make the first attempt now.
+fn commit_stage(id: &str) -> Result<(), String> {
+    let (staged, payload) = discord::read_stage(id)?;
+    let hook = discord::find_webhook(&staged.webhook)?;
+    ensure_dirs()?;
+    let out_id = now_id();
+    let dir = state_dir().join("out").join(&out_id);
+    private_dir(&dir)?;
+    fs::write(dir.join("payload"), &payload).map_err(|e| e.to_string())?;
+    private_file(&dir.join("payload"))?;
+    let outgoing = Outgoing {
+        id: out_id.clone(),
+        kind: staged.kind.clone(),
+        name: staged.name.clone(),
+        digest: digest(&payload),
+        created: now_secs(),
+        recipients: vec![new_recipient(format!("discord:{}", hook.name))],
+    };
+    write_meta(&dir, &outgoing)?;
+    discord::drop_stage(id);
+    // Send now from this process; the service retries what is left.
+    let cfg = load_config().unwrap_or_default();
+    let hooks = Ok(vec![hook]);
+    let mut peers = || Ok(Vec::new());
+    let mut deliver = |_: &Delivery| -> Result<(), DeliverError> {
+        Err(DeliverError {
+            message: "not a device".into(),
+            permanent: false,
+        })
+    };
+    let mut poster = discord::Http;
+    let mut env = QueueEnv {
+        cfg: &cfg,
+        now: now_secs(),
+        peers: &mut peers,
+        deliver: &mut deliver,
+        contacts: None,
+        notify: notifications_enabled(),
+        hooks: &hooks,
+        poster: &mut poster,
+    };
+    process_queue_filtered(
+        &state_dir().join("out"),
+        &history_path(),
+        &mut env,
+        Some(&out_id),
+    );
+    // The entry is archived when it is final; otherwise it waits for a retry.
+    let still = fs::read(dir.join("meta.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Outgoing>(&b).ok());
+    match still {
+        None => {
+            let record = read_history(&history_path())
+                .into_iter()
+                .rev()
+                .find(|h| h["id"] == out_id.as_str());
+            let r = record.as_ref().map(|h| &h["recipients"][0]);
+            let status = r.and_then(|r| r["status"].as_str()).unwrap_or("delivered");
+            if status == "delivered" {
+                println!("{out_id}");
+                eprintln!(
+                    "Sent to discord:{}. Undo within {}: nirushare discord undo {out_id}",
+                    staged.webhook,
+                    span(discord::UNDO_SECS)
+                );
+                Ok(())
+            } else {
+                let why = r
+                    .and_then(|r| r["last_error"].as_str())
+                    .unwrap_or("failed")
+                    .to_string();
+                Err(format!("not sent to discord:{}: {why}", staged.webhook))
+            }
+        }
+        Some(o) => {
+            wake_service();
+            println!("{out_id}");
+            eprintln!(
+                "Queued for discord:{}: {}; it will be retried.",
+                staged.webhook, o.recipients[0].last_error
+            );
+            Ok(())
+        }
+    }
+}
+
+fn send_discord(names: &[String], source: &Source, yes: bool) -> Result<(), String> {
+    if names.len() != 1 {
+        return Err("send to one Discord webhook at a time".into());
+    }
+    let hook = discord::find_webhook(&names[0])?;
+    let (kind, name, payload) = discord_content(source)?;
+    let staged = discord::stage(&hook.name, &kind, &name, &payload)?;
+    let preview = discord::preview_json(&hook, &staged, &payload);
+    eprint!("{}", discord::preview_text(&preview));
+    if preview["too_large"] == true {
+        discord::drop_stage(&staged.id);
+        return Err(format!("too large for discord:{}", hook.name));
+    }
+    let go = yes || confirm_on_tty(&format!("Send to Discord · {}?", hook.name))?;
+    if !go {
+        discord::drop_stage(&staged.id);
+        eprintln!("Nothing was sent.");
+        return Ok(());
+    }
+    commit_stage(&staged.id)
+}
+
 fn send(args: &[String]) -> Result<(), String> {
     let cfg = load_config()?;
     let all = args.iter().any(|a| a == "--all");
+    let yes = args.iter().any(|a| a == "--yes" || a == "-y");
     let mut recipients = Vec::new();
-    let mut file: Option<PathBuf> = None;
-    let mut stdin_text = false;
+    let mut discord_names: Vec<String> = Vec::new();
+    let mut source = Source::Clipboard;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--to" if i + 1 < args.len() => {
                 let host = args[i + 1].clone();
+                if let Some(name) = host.strip_prefix("discord:") {
+                    if !discord::valid_name(name) {
+                        return Err("invalid Discord webhook name".into());
+                    }
+                    discord_names.push(name.to_string());
+                    i += 2;
+                    continue;
+                }
                 if !valid_host(&host) {
                     return Err("invalid host".into());
                 }
@@ -1773,78 +2105,62 @@ fn send(args: &[String]) -> Result<(), String> {
                     .iter()
                     .find(|t| t.host == host || t.host.split('.').next() == Some(host.as_str()))
                     .ok_or_else(|| format!("not trusted: {host}"))?;
-                recipients.push(Recipient {
-                    host: t.host.clone(),
-                    token: String::new(),
-                    status: "pending".into(),
-                    attempts: 0,
-                    last_error: String::new(),
-                    next_attempt: 0,
-                    backoff: 0,
-                });
+                recipients.push(new_recipient(t.host.clone()));
                 i += 2;
             }
-            "--all" => {
+            "--all" | "--yes" | "-y" | "--clipboard" => {
                 i += 1;
             }
             "--file" if i + 1 < args.len() => {
-                file = Some(PathBuf::from(&args[i + 1]));
+                source = Source::File(PathBuf::from(&args[i + 1]));
                 i += 2;
             }
-            "--clipboard" => {
+            "--stdin" | "-" => {
+                source = Source::Stdin;
                 i += 1;
             }
-            "--stdin" => {
-                stdin_text = true;
+            other if !other.starts_with('-') => {
+                source = Source::File(PathBuf::from(other));
                 i += 1;
             }
             _ => return Err(format!("unknown send option: {}", args[i])),
         }
     }
+    if !discord_names.is_empty() {
+        if all || !recipients.is_empty() {
+            return Err("send to Discord and to devices separately".into());
+        }
+        return send_discord(&discord_names, &source, yes);
+    }
     if all {
         for t in &cfg.trusted {
-            recipients.push(Recipient {
-                host: t.host.clone(),
-                token: String::new(),
-                status: "pending".into(),
-                attempts: 0,
-                last_error: String::new(),
-                next_attempt: 0,
-                backoff: 0,
-            });
+            recipients.push(new_recipient(t.host.clone()));
         }
     }
     if recipients.is_empty() {
-        return Err("choose --to HOST or --all".into());
+        return Err("choose --to HOST, --to discord:NAME or --all".into());
     }
-    let (kind, name, payload) = if let Some(path) = file {
-        let bytes = fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-        if bytes.len() > MAX_BYTES {
-            return Err("file too large".into());
+    let (kind, name, payload) = match source {
+        Source::File(path) => {
+            let bytes = fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+            if bytes.len() > MAX_BYTES {
+                return Err("file too large".into());
+            }
+            image_extension(&bytes)
+                .ok_or_else(|| "only PNG, JPEG or WebP images are supported".to_string())?;
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("file")
+                .to_string();
+            ("image".to_string(), name, bytes)
         }
-        image_extension(&bytes)
-            .ok_or_else(|| "only PNG, JPEG or WebP images are supported".to_string())?;
-        let name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("file")
-            .to_string();
-        ("image".to_string(), name, bytes)
-    } else if stdin_text {
-        let mut text = Vec::new();
-        std::io::stdin()
-            .take(MAX_TEXT_BYTES as u64 + 1)
-            .read_to_end(&mut text)
-            .map_err(|e| format!("stdin: {e}"))?;
-        if text.len() > MAX_TEXT_BYTES {
-            return Err("text too large".into());
-        }
-        if text.is_empty() {
-            return Err("no text on stdin".into());
-        }
-        ("text".to_string(), "text.txt".to_string(), text)
-    } else {
-        read_clipboard()?
+        Source::Stdin => (
+            "text".to_string(),
+            "text.txt".to_string(),
+            read_stdin_text()?,
+        ),
+        Source::Clipboard => read_clipboard()?,
     };
     let id = now_id();
     let dir = state_dir().join("out").join(&id);
@@ -1863,6 +2179,75 @@ fn send(args: &[String]) -> Result<(), String> {
     wake_service();
     println!("{id}");
     Ok(())
+}
+
+/// `nirushare discord ...`
+fn discord_command(args: &[String]) -> Result<(), String> {
+    let sub = args.first().map(String::as_str).unwrap_or("help");
+    let rest = if args.is_empty() { &[][..] } else { &args[1..] };
+    match sub {
+        "list" => discord::list(rest),
+        "check" => discord::check(rest),
+        "undo" if rest.len() == 1 => {
+            let msg = discord::undo(&rest[0])?;
+            println!("{msg}");
+            Ok(())
+        }
+        "undo-notice" if rest.len() == 1 => discord::undo_notice(&rest[0]),
+        "confirm" if rest.len() == 1 => commit_stage(&rest[0]),
+        "cancel" if rest.len() == 1 => {
+            discord::drop_stage(&rest[0]);
+            Ok(())
+        }
+        "preview" => {
+            let mut name = None;
+            let mut source = Source::Clipboard;
+            let mut json = false;
+            let mut i = 0;
+            while i < rest.len() {
+                match rest[i].as_str() {
+                    "--to" if i + 1 < rest.len() => {
+                        let n = rest[i + 1].trim_start_matches("discord:").to_string();
+                        name = Some(n);
+                        i += 2;
+                    }
+                    "--file" if i + 1 < rest.len() => {
+                        source = Source::File(PathBuf::from(&rest[i + 1]));
+                        i += 2;
+                    }
+                    "--stdin" | "-" => {
+                        source = Source::Stdin;
+                        i += 1;
+                    }
+                    "--clipboard" => i += 1,
+                    "--json" => {
+                        json = true;
+                        i += 1;
+                    }
+                    other => return Err(format!("unknown preview option: {other}")),
+                }
+            }
+            let name = name.ok_or("choose --to NAME")?;
+            let hook = discord::find_webhook(&name)?;
+            let (kind, item, payload) = discord_content(&source)?;
+            let staged = discord::stage(&hook.name, &kind, &item, &payload)?;
+            let v = discord::preview_json(&hook, &staged, &payload);
+            if json {
+                println!("{v}");
+            } else {
+                print!("{}", discord::preview_text(&v));
+                println!("Send it with: nirushare discord confirm {}", staged.id);
+            }
+            Ok(())
+        }
+        "help" | "--help" => {
+            print!("{}", discord::HELP);
+            Ok(())
+        }
+        other => Err(format!(
+            "unknown discord command: {other} (see nirushare discord help)"
+        )),
+    }
 }
 fn trust(host: &str, token: &str) -> Result<(), String> {
     if !valid_host(host) || token.len() < 32 || !token.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -1898,7 +2283,7 @@ fn status(args: &[String]) -> Result<(), String> {
     let cfg = load_config()?;
     let now = now_secs();
     let peers = tailscale().map(|(_, p)| p);
-    let v = status_json(
+    let mut v = status_json(
         &cfg,
         &peers,
         &read_outgoing(&state_dir().join("out")),
@@ -1906,6 +2291,15 @@ fn status(args: &[String]) -> Result<(), String> {
         &read_contacts(&contacts_path()),
         now,
     );
+    // Discord webhooks by name only; the URLs never leave webhooks.toml.
+    v["discord"] = match discord::load_webhooks() {
+        Ok(hooks) => hooks
+            .iter()
+            .map(|h| serde_json::json!({"name": h.name, "host": h.url_host()}))
+            .collect::<Vec<_>>()
+            .into(),
+        Err(e) => serde_json::json!({ "error": e }),
+    };
     let json = args.iter().any(|a| a == "--json")
         || (!args.iter().any(|a| a == "--text") && !std::io::stdout().is_terminal());
     if json {
@@ -2211,7 +2605,7 @@ fn main() {
             Ok(())
         }
         Some("--help") | None => {
-            println!("NIRUSHARE {}\nUsage: nirushare serve|devices|trust HOST TOKEN|revoke HOST|token|send --to HOST|--all [--file PATH|--stdin]|inbox [--clear-read] [--older-than 30d] [--yes]|outbox|status [--json|--text]|copy ID|open ID|email", env!("CARGO_PKG_VERSION"));
+            println!("NIRUSHARE {}\nUsage: nirushare serve|devices|trust HOST TOKEN|revoke HOST|token|send --to HOST|--all [--file PATH|--stdin]|send --to discord:NAME [FILE|-|--clipboard] [--yes]|discord list|check|preview|confirm|undo|help|inbox [--clear-read] [--older-than 30d] [--yes]|outbox|status [--json|--text]|copy ID|open ID|email", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
         Some("serve") => serve(),
@@ -2227,6 +2621,7 @@ fn main() {
         Some("trust") if args.len() == 3 => trust(&args[1], &args[2]),
         Some("revoke") if args.len() == 2 => revoke(&args[1]),
         Some("send") => send(&args[1..]),
+        Some("discord") => discord_command(&args[1..]),
         Some("inbox") => inbox_cleanup(&args[1..]),
         Some("status") => status(&args[1..]),
         Some("outbox") => outbox(),
@@ -2279,6 +2674,7 @@ mod tests {
             last_error: String::new(),
             next_attempt: 0,
             backoff: 0,
+            message_ids: Vec::new(),
         }
     }
     fn queue_entry(out: &Path, id: &str, created: u64, recipients: Vec<Recipient>) -> PathBuf {
@@ -2357,6 +2753,8 @@ mod tests {
             deliver: &mut deliver,
             contacts: None,
             notify: false,
+            hooks: &Ok(Vec::new()),
+            poster: &mut discord::Http,
         };
         process_queue(&out, &history, &mut env);
         assert!(!done.exists(), "final entry and its payload are removed");
@@ -2388,6 +2786,8 @@ mod tests {
             deliver: &mut deliver,
             contacts: None,
             notify: false,
+            hooks: &Ok(Vec::new()),
+            poster: &mut discord::Http,
         };
         process_queue(&out, &history, &mut env);
         assert_eq!(read_meta(&waiting).recipients[0].status, "waiting");
@@ -2430,6 +2830,8 @@ mod tests {
             deliver: &mut deliver,
             contacts: None,
             notify: false,
+            hooks: &Ok(Vec::new()),
+            poster: &mut discord::Http,
         };
         process_queue(&out, &history, &mut env);
         let meta = read_meta(&dir);
@@ -2456,6 +2858,8 @@ mod tests {
             deliver: &mut deliver,
             contacts: None,
             notify: false,
+            hooks: &Ok(Vec::new()),
+            poster: &mut discord::Http,
         };
         process_queue(&out, &history, &mut env);
         assert!(!dir.exists());
@@ -2483,6 +2887,8 @@ mod tests {
             deliver: &mut deliver,
             contacts: None,
             notify: false,
+            hooks: &Ok(Vec::new()),
+            poster: &mut discord::Http,
         };
         process_queue(&out, &history, &mut env);
         assert_eq!(read_meta(&fresh).created, mtime);
@@ -2494,6 +2900,8 @@ mod tests {
             deliver: &mut deliver,
             contacts: None,
             notify: false,
+            hooks: &Ok(Vec::new()),
+            poster: &mut discord::Http,
         };
         process_queue(&out, &history, &mut env);
         assert!(!fresh.exists() && !old.exists());
@@ -2535,6 +2943,8 @@ mod tests {
                 deliver: &mut deliver,
                 contacts: None,
                 notify: false,
+                hooks: &Ok(Vec::new()),
+                poster: &mut discord::Http,
             };
             process_queue(&out, &history, &mut env)
         };
@@ -2578,6 +2988,8 @@ mod tests {
             deliver: &mut deliver,
             contacts: None,
             notify: false,
+            hooks: &Ok(Vec::new()),
+            poster: &mut discord::Http,
         };
         assert_eq!(process_queue(&out, &root.join("h"), &mut env), None);
     }
@@ -2696,6 +3108,8 @@ mod tests {
             deliver: &mut deliver,
             contacts: Some(&contacts),
             notify: false,
+            hooks: &Ok(Vec::new()),
+            poster: &mut discord::Http,
         };
         process_queue(&out, &history, &mut env);
         record_contact(&contacts, "algiz.tail.ts.net", "received", now - 7200);
